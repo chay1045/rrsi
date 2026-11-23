@@ -86,12 +86,9 @@ def build(client=None, ctx: tools.Context | None = None):
         return update
 
     def after_agent(state: State) -> str:
-        calls = state["messages"][-1].get("tool_calls") or []
-        if any(c["function"]["name"] == "answer" for c in calls):
-            return "tools"  # run it even on the last allowed turn
-        if state["turns"] >= policy.MAX_TURNS:
-            return END
-        return "tools" if calls else END
+        # The cap is enforced in after_tools, so the last call still gets its
+        # result: a trace that ends on an unanswered call says nothing.
+        return "tools" if state["messages"][-1].get("tool_calls") else END
 
     def after_tools(state: State) -> str:
         if state.get("answer") is not None:

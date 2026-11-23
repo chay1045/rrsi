@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -122,16 +123,19 @@ def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
         return reply
 
     started = time.monotonic()
+    interrupted = None
     try:
         state = graph.run(task.query, model, ctx or _context(task))
         status, error = "ok", None
         turns, answer = state["turns"], state["answer"]
         # The final act's result never reaches another model call.
         _add_tool_results(history, seen, state["messages"])
-    except Exception as exc:  # a failed episode is a wrong answer, not a crash
+    except BaseException as exc:  # Ctrl-C / SIGTERM must still leave a trace
         status, error = "error", f"{type(exc).__name__}: {exc}"
         answer = "UNKNOWN"
         turns = sum(1 for m in history if m.get("role") == "assistant")
+        if not isinstance(exc, Exception):
+            interrupted = exc
     wall_time = round(time.monotonic() - started, 3)
 
     usage.setdefault("total_tokens", 0)
@@ -152,6 +156,8 @@ def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
     _write(out / "trajectory.json", json.dumps(trajectory, ensure_ascii=False))
     if status == "ok":
         _write(answer_path, answer + "\n")
+    if interrupted is not None:
+        raise interrupted
     return trajectory
 
 
@@ -181,5 +187,11 @@ def main(argv: list[str] | None = None) -> int:
     return 0 if trajectory["status"] in {"ok", "skipped"} else 1
 
 
+def _terminate(signum, frame):
+    # Turn a SIGTERM into an exception so the partial trace gets written.
+    raise SystemExit(128 + signum)
+
+
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _terminate)
     sys.exit(main())

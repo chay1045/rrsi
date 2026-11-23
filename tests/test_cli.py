@@ -137,3 +137,15 @@ def test_main_resolves_the_task_id(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as exit_info:
         cli.main(["--task", "Nope/q_9", "--out", str(tmp_path / "x")])
     assert exit_info.value.code == 2
+
+
+def test_interrupt_still_writes_a_partial_trajectory(tmp_path):
+    def interrupted(messages, specs):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.run_task(TASK, tmp_path, client=interrupted, ctx=CTX)
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    assert trajectory["status"] == "error"
+    assert trajectory["error"].startswith("KeyboardInterrupt")
+    assert not (tmp_path / "answer.txt").exists()

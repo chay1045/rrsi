@@ -58,6 +58,8 @@ def test_stops_at_max_turns(monkeypatch):
     assert state["turns"] == 3
     assert len(client.calls) == 3
     assert state["answer"] == "UNKNOWN"
+    # the last call still gets its result, so the trace has no dangling call
+    assert [m["role"] for m in state["messages"]][-2:] == ["assistant", "tool"]
 
 
 def test_unknown_tool_is_an_error_string():
