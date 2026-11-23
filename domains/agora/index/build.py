@@ -34,6 +34,7 @@ INDEX_DIR = (
 )
 
 MIN_TOK, MAX_TOK, OVERLAP_TOK = 512, 800, 80
+STRAY_TOK = 32  # footer/page-number leftovers, folded into a neighbour chunk
 SUFFIXES = {".md": "md", ".xlsx": "xlsx", ".csv": "csv"}
 HEADING = re.compile(r"^(#{1,6})\s+(\S.*?)\s*$")
 CJK = re.compile(r"[\u2e80-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]")
@@ -48,13 +49,11 @@ CREATE TABLE chunks (
     line_start INTEGER NOT NULL,
     line_end INTEGER NOT NULL,
     heading_path TEXT NOT NULL,
-    text TEXT NOT NULL
+    text TEXT NOT NULL,  -- original text; what retrieval returns
+    cjk TEXT NOT NULL  -- cjk_split(text): searchable copy for CJK phrase queries
 );
--- shortcut: unicode61 keeps a whole CJK run as one token (5614/5966 Finance docs
--- hold Chinese/Japanese text), so CJK queries must use prefix search ("*") or
--- exact runs; move to a trigram/second FTS table if recall@10 for CJK falls short.
 CREATE VIRTUAL TABLE chunks_fts USING fts5(
-    text, content='chunks', content_rowid='chunk_id', tokenize='porter unicode61');
+    text, cjk, content='chunks', content_rowid='chunk_id', tokenize='porter unicode61');
 """
 
 
@@ -84,6 +83,17 @@ def n_tokens(text: str) -> int:
     """
     cjk = len(CJK.findall(text))
     return cjk + (len(text) - cjk) // 4
+
+
+def cjk_split(text: str) -> str:
+    """Space-separate CJK characters into the `cjk` column.
+
+    unicode61 keeps a whole CJK run as one token, so 动力电池储能 would never
+    match a query for 储能. A spaced copy makes any substring a phrase match:
+    query `cjk:"<cjk_split(term)>"`, e.g. cjk:"储 能". Latin words and numbers
+    are already in `text`, so only the CJK characters are copied here.
+    """
+    return " ".join(CJK.findall(text))
 
 
 def _md_units(text: str, title: str) -> Iterator[Unit]:
@@ -157,8 +167,10 @@ def _load_workbook(path: Path) -> openpyxl.Workbook:
 
 def _xlsx_units(path: Path) -> Iterator[Unit]:
     wb = _load_workbook(path)
+    lineno = 0  # numbered across sheets so a chunk spanning two keeps a sane range
     for sheet in wb.sheetnames:
-        for lineno, row in enumerate(wb[sheet].iter_rows(values_only=True), 1):
+        for row in wb[sheet].iter_rows(values_only=True):
+            lineno += 1
             unit = _row(f"{path.stem} > {sheet}", lineno,
                         [(get_column_letter(i), v) for i, v in enumerate(row, 1)])
             if unit:
@@ -191,7 +203,8 @@ def _fit(unit: Unit) -> Iterator[Unit]:
             if space > pos + (end - pos) // 2:
                 end = space + 1
         piece = text[pos:end]
-        newlines = piece.count("\n")
+        # clamp to the unit's own span: a csv record index is not a line number
+        newlines = min(piece.count("\n"), unit.line_end - line)
         yield Unit(unit.heading_path, line, line + newlines, piece.strip())
         line += newlines
         pos = end
@@ -203,6 +216,8 @@ def chunks(units: list[Unit]) -> list[Chunk]:
     group: list[Unit] = []
     size = 0
     for unit in [piece for unit in units for piece in _fit(unit)]:
+        if not any(c.isalnum() for c in unit.text):  # "---" rules, page separators
+            continue
         n = n_tokens(unit.text) + 1  # +1 for the "\n\n" join and per-unit rounding
         overflow = size + n > MAX_TOK
         if group and (overflow or (size >= MIN_TOK and unit.heading_path != group[0].heading_path)):
@@ -219,17 +234,29 @@ def chunks(units: list[Unit]) -> list[Chunk]:
     if group:
         groups.append(group)
 
-    if len(groups) > 1:
-        tail = sum(n_tokens(u.text) + 1 for u in groups[-1])
-        prev = sum(n_tokens(u.text) + 1 for u in groups[-2])
-        if tail < MIN_TOK and prev + tail <= MAX_TOK:
-            groups[-2].extend(groups.pop())
-
     return [
-        Chunk(g[0].heading_path, g[0].line_start, g[-1].line_end,
-              "\n\n".join(u.text for u in g))
-        for g in groups
+        Chunk(max(g, key=lambda u: n_tokens(u.text)).heading_path,
+              g[0].line_start, g[-1].line_end, "\n\n".join(u.text for u in g))
+        for g in _fold_strays(groups)
     ]
+
+
+def _fold_strays(groups: list[list[Unit]]) -> list[list[Unit]]:
+    """Fold footer-sized chunks into a neighbour so page numbers get no chunk of their own."""
+    def size(group: list[Unit]) -> int:
+        return sum(n_tokens(u.text) + 1 for u in group)
+
+    out: list[list[Unit]] = []
+    for i, group in enumerate(groups):
+        if size(group) < STRAY_TOK:
+            if i + 1 < len(groups) and size(group) + size(groups[i + 1]) <= MAX_TOK:
+                groups[i + 1] = group + groups[i + 1]
+                continue
+            if out and size(out[-1]) + size(group) <= MAX_TOK:
+                out[-1].extend(group)
+                continue
+        out.append(group)
+    return out
 
 
 def _slug(domain: str) -> str:
@@ -258,11 +285,12 @@ def build_domain(domain: str, docs_dir: Path = DOCS_DIR,
             if kind is None:
                 continue
             doc_path = f"documents/{domain}/{path.relative_to(root).as_posix()}"
-            rows = [(domain, doc_path, c.line_start, c.line_end, c.heading_path, c.text)
+            rows = [(domain, doc_path, c.line_start, c.line_end, c.heading_path,
+                     c.text, cjk_split(c.text))
                     for c in chunks(list(_units(path)))]
             con.executemany(
-                "INSERT INTO chunks (domain, doc_path, line_start, line_end, heading_path, text)"
-                " VALUES (?, ?, ?, ?, ?, ?)", rows)
+                "INSERT INTO chunks (domain, doc_path, line_start, line_end, heading_path,"
+                " text, cjk) VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
             counts[kind] += 1
             total += len(rows)
         con.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')")

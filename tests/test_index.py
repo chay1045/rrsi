@@ -24,10 +24,13 @@ def test_build_domain_chunks_and_fts(tmp_path):
         "# Intro\n\n" + "\n\n".join([para] * 12) + "\n\n## Tail\n\nzebra 12345.678\n",
         encoding="utf-8")
     (root / "t.csv").write_text("year,value\n2024,12345.678\n", encoding="utf-8")
+    (root / "c.md").write_text(
+        "# 报告\n\n动力电池储能出货高增，同比+98.9%。\n\n---\n\n114\n",
+        encoding="utf-8")
 
     counts, n_chunks, db = build.build_domain("Test Domain", docs, tmp_path / "index")
 
-    assert counts == {"md": 1, "xlsx": 0, "csv": 1}
+    assert counts == {"md": 2, "xlsx": 0, "csv": 1}
     con = sqlite3.connect(db)
     rows = con.execute(
         "SELECT doc_path, line_start, line_end, heading_path, text FROM chunks").fetchall()
@@ -46,6 +49,15 @@ def test_build_domain_chunks_and_fts(tmp_path):
     csv_rows = [r for r in rows if r[0].endswith("/t.csv")]
     assert len(csv_rows) == 1 and csv_rows[0][1:3] == (1, 2)
     assert "B: 12345.678" in csv_rows[0][4]
+
+    # a CJK term is findable mid-run, and separator/page-number text is not its
+    # own chunk; no chunk is only punctuation
+    cjk = con.execute(
+        "SELECT c.text FROM chunks_fts f JOIN chunks c ON c.chunk_id = f.rowid"
+        " WHERE chunks_fts MATCH ?", (f'cjk:"{build.cjk_split("储能")}"',)).fetchall()
+    assert len(cjk) == 1 and "动力电池储能" in cjk[0][0]
+    assert all(any(ch.isalnum() for ch in r[4]) for r in rows)
+    assert not any(r[4].strip() in {"---", "114"} for r in rows)
 
 
 def test_oversized_paragraph_is_split_then_packed():
