@@ -25,47 +25,16 @@ from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import build  # same directory, shares INDEX_DIR/DATA_DIR/cjk_split
+import build  # same directory, shares INDEX_DIR/DATA_DIR
+from search import K, match_expression, search  # noqa: F401  (re-exported for tests)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import tasks as agora_tasks  # noqa: E402  (path insert must come first)
 
 GATE = 0.70
-K = 10
 PAGE = re.compile(r"<!-- pages (\d+)-(\d+) -->")
-WORD = re.compile(r"[A-Za-z0-9]+")
-CJK_RUN = re.compile(r"[\u2e80-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]+")
-STOP = frozenset(
-    "a an and are as at be been by can does do for from had has have how if in into "
-    "is it its may not of on or that the their then there these this to was were "
-    "what when where which who whose why will with".split())
 
 WHOLE_DOC = [(1, 1 << 60)]
-
-
-def match_expression(text: str) -> str:
-    """FTS5 MATCH expression: every query term OR-ed, each quoted.
-
-    Stopwords are dropped because Agora questions are long prose; keeping the
-    glue turns the ranking into noise. ``bm25`` ranks the OR matches.
-    """
-    words = [w for w in WORD.findall(text.casefold()) if w not in STOP]
-    parts = [f'"{w}"' for w in dict.fromkeys(words)]
-    parts += [f'cjk:"{build.cjk_split(run)}"' for run in CJK_RUN.findall(text)]
-    return " OR ".join(parts)
-
-
-def search(con: sqlite3.Connection, query: str, k: int = K) -> list[tuple[str, int, int]]:
-    expression = match_expression(query)
-    if not expression:
-        return []
-    rows = con.execute(
-        "SELECT c.doc_path, c.line_start, c.line_end"
-        " FROM chunks_fts f JOIN chunks c ON c.chunk_id = f.rowid"
-        " WHERE chunks_fts MATCH ? ORDER BY bm25(chunks_fts) LIMIT ?",
-        (expression, k),
-    ).fetchall()
-    return [(r[0], r[1], r[2]) for r in rows]
 
 
 def page_spans(text: str) -> list[tuple[int, int, int, int]]:
@@ -119,8 +88,9 @@ def ranks(hits: list[tuple[str, int, int]], refs: list[dict],
     return file_rank, region_rank
 
 
-def evaluate(domains: list[str]) -> dict[str, list[tuple[int | None, int | None]]]:
-    all_tasks = agora_tasks.load_tasks()
+def evaluate(domains: list[str],
+             all_tasks: dict[tuple[str, str], agora_tasks.Task]
+             ) -> dict[str, list[tuple[int | None, int | None]]]:
     per_domain: dict[str, list[tuple[int | None, int | None]]] = {}
     for domain in domains:
         db_path = build.INDEX_DIR / f"{build._slug(domain)}.sqlite"
@@ -194,14 +164,15 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--out", type=Path, help="write the markdown here, default stdout")
     args = parser.parse_args(argv)
 
-    known = sorted({task.domain for task in agora_tasks.load_tasks().values()})
+    all_tasks = agora_tasks.load_tasks()
+    known = sorted({task.domain for task in all_tasks.values()})
     domains = args.domain or known
     unknown = [d for d in domains if d not in known]
     if unknown:
         parser.error(f"unknown domain(s): {', '.join(unknown)}")
 
     started = time.perf_counter()
-    per_domain = evaluate(domains)
+    per_domain = evaluate(domains, all_tasks)
     markdown = report(per_domain, args.mode, time.perf_counter() - started)
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)

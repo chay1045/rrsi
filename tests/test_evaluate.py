@@ -13,6 +13,14 @@ evaluate = module_from_spec(spec)
 sys.modules[spec.name] = evaluate
 spec.loader.exec_module(evaluate)
 
+import search  # noqa: E402  (index/ is on sys.path after loading evaluate)
+
+
+def test_evaluate_uses_the_shared_query_builder():
+    # Gate 2 must measure the same query the harness's search_docs will send.
+    assert evaluate.match_expression is search.match_expression
+    assert evaluate.search is search.search
+
 
 def test_match_expression_drops_glue_and_quotes_terms():
     expression = evaluate.match_expression("What is the total of 4.2 percent?")
