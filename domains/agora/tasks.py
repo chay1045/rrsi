@@ -24,6 +24,7 @@ class Task:
     qid: str
     query: str
     gold: str
+    refs: list[dict]  # reference_files: [{"path", "page_start", "page_end"}]
 
     @property
     def id(self) -> str:
@@ -38,7 +39,8 @@ def load_tasks(tasks_dir: Path | None = None) -> dict[tuple[str, str], Task]:
             if line.strip():
                 row = json.loads(line)
                 tasks[(row["domain"], row["id"])] = Task(
-                    row["domain"], row["id"], row["query"], str(row["answer"]))
+                    row["domain"], row["id"], row["query"], str(row["answer"]),
+                    row.get("reference_files") or [])
     if not tasks:
         # An unmounted AGORA_DATA must not read as "0 tasks, score 0.0".
         raise FileNotFoundError(f"no tasks/*.jsonl under {root}")
