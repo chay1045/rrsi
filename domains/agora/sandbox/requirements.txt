@@ -1,0 +1,15 @@
+# Runtime for the Agora agent harness. Versions follow the host .venv for the
+# graph and client; the scientific stack is bounded because the harness only
+# advertises "pandas, numpy, scipy" and the PDF helpers are optional extras.
+langgraph==1.2.24
+openai==3.57.0
+pandas==3.1.1
+numpy==2.5.5
+scipy>=1.14,<2
+openpyxl==3.1.5
+lxml>=5,<7
+beautifulsoup4>=4.12,<5
+PyYAML==6.0.4
+PyMuPDF>=1.24,<2
+pdfplumber>=0.11,<1
+tabulate>=0.9,<1
