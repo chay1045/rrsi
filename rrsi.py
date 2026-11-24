@@ -51,6 +51,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
+from rrsi.env import load_env                # noqa: E402
+load_env(start=ROOT)                         # .env wins only where unset
+
 from rrsi import gitops as G                 # noqa: E402
 from rrsi.config import RRSIConfig          # noqa: E402
 from rrsi.domain import load_domain          # noqa: E402

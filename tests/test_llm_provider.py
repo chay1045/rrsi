@@ -136,6 +136,14 @@ def test_missing_base_url_and_key_fail_clearly(monkeypatch):
         llm._openai_client()
 
 
+def test_blank_rrsi_base_url_does_not_fall_back_to_policy_endpoint(monkeypatch):
+    monkeypatch.setenv("RRSI_BASE_URL", "")
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1")
+    monkeypatch.setenv("RRSI_API_KEY", "cloud-key")
+    with pytest.raises(RuntimeError, match="RRSI_BASE_URL"):
+        llm._openai_client()
+
+
 def test_openai_client_reads_base_url_and_key_from_env(monkeypatch):
     pytest.importorskip("openai")
     monkeypatch.setenv("RRSI_BASE_URL", "http://stub/v1/")

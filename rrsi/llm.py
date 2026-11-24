@@ -70,10 +70,13 @@ def _provider() -> str:
 
 def _openai_client():
     """Client for the OpenAI-compatible endpoint; env only, never a key file."""
-    base_url = (os.environ.get("RRSI_BASE_URL")
-                or os.environ.get("OPENAI_BASE_URL") or "").strip()
-    api_key = (os.environ.get("RRSI_API_KEY")
-               or os.environ.get("OPENAI_API_KEY") or "").strip()
+    base_url = os.environ.get("RRSI_BASE_URL")
+    if base_url is None:
+        base_url = os.environ.get("OPENAI_BASE_URL")
+    api_key = os.environ.get("RRSI_API_KEY")
+    if api_key is None:
+        api_key = os.environ.get("OPENAI_API_KEY")
+    base_url, api_key = (base_url or "").strip(), (api_key or "").strip()
     if not base_url:
         raise RuntimeError("set RRSI_BASE_URL (or OPENAI_BASE_URL) for "
                            "RRSI_PROVIDER=openai")
@@ -183,5 +186,13 @@ def generate(prompt: str, system: str | None = None, max_retries: int = 6,
     raise RuntimeError(f"generate failed after {max_retries} tries: {last_err}")
 
 
+def _main() -> None:
+    """CLI smoke check; load .env after import so tests stay hermetic."""
+    from .env import load_env
+    load_env(start=os.path.dirname(os.path.dirname(__file__)))
+    model = os.environ.get("RRSI_SEARCH_MODEL") or MODEL
+    print(generate("Reply with exactly: OK", max_tokens=16, model=model))
+
+
 if __name__ == "__main__":
-    print(generate("Reply with exactly: OK", max_tokens=16))
+    _main()
