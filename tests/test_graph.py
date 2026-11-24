@@ -101,6 +101,44 @@ def test_content_reply_without_tools_ends_the_episode():
     assert state["answer"] == "42"
 
 
+def test_empty_turn_is_nudged_then_recovers():
+    client = scripted({"role": "assistant", "content": None},
+                      call("answer", {"value": "7"}))
+    state = graph.run("q", client, CTX)
+    assert state["answer"] == "7"
+    assert state["turns"] == 2
+    assert state["empty_retries"] == 1
+    assert any(message["role"] == "user"
+               and message["content"] == policy.EMPTY_TURN_NUDGE
+               for message in client.calls[1])
+
+
+def test_whitespace_reply_is_an_empty_turn():
+    client = scripted({"role": "assistant", "content": "   "},
+                      call("answer", {"value": "8"}))
+    state = graph.run("q", client, CTX)
+    assert state["answer"] == "8"
+    assert state["empty_retries"] == 1
+
+
+def test_empty_turns_stop_after_the_retry_bound(monkeypatch):
+    monkeypatch.setattr(policy, "EMPTY_TURN_RETRIES", 2)
+    client = scripted(*[{"role": "assistant", "content": None} for _ in range(5)])
+    state = graph.run("q", client, CTX)
+    assert state["answer"] == "UNKNOWN"
+    assert state["turns"] == 3
+    assert len(client.calls) == 3
+
+
+def test_empty_turn_at_the_turn_cap_does_not_retry(monkeypatch):
+    monkeypatch.setattr(policy, "MAX_TURNS", 1)
+    client = scripted({"role": "assistant", "content": None})
+    state = graph.run("q", client, CTX)
+    assert state["answer"] == "UNKNOWN"
+    assert state["turns"] == 1
+    assert len(client.calls) == 1
+
+
 def test_trim_drops_oldest_tool_block_and_keeps_system():
     big = {"role": "tool", "tool_call_id": "a", "content": "x" * 500}
     messages = [

@@ -14,10 +14,15 @@ harness.
 
 ## P1. Empty assistant turn ends the episode
 
-**Mechanism.** `graph.after_agent` routes any assistant message without tool
-calls to `END`. A model can spend its whole completion budget on reasoning and
-return `content=None` with no tool call. The episode then ends with no answer,
-and `graph.run` falls back to `UNKNOWN`.
+**Status:** fixed in H_0 before the baseline. `policy.MAX_TOKENS` is 4096 and
+`graph` has a bounded `nudge` node (`policy.EMPTY_TURN_RETRIES`), so an empty
+reply no longer ends the episode. Do not add a second retry loop; improve the
+existing one only if the baseline still shows empty turns at `END`.
+
+**Mechanism (old H_0).** `graph.after_agent` routed any assistant message
+without tool calls to `END`. A model can spend its whole completion budget on
+reasoning and return `content=None` with no tool call. The episode then ends
+with no answer, and `graph.run` falls back to `UNKNOWN`.
 
 **Evidence.**
 - task: `Education, Science & Academia/q_0046`

@@ -20,6 +20,7 @@ from . import context, policy, prompts, tools
 class State(TypedDict, total=False):
     messages: list[dict]
     turns: int
+    empty_retries: int
     answer: str
     usage: dict
 
@@ -27,6 +28,12 @@ class State(TypedDict, total=False):
 def _tool_message(call: dict, content: str) -> dict:
     return {"role": "tool", "tool_call_id": call.get("id") or "",
             "content": content}
+
+
+def _empty_reply(message: dict) -> bool:
+    """A reply with no content and no tool call cannot advance the episode."""
+    return (not message.get("tool_calls")
+            and not str(message.get("content") or "").strip())
 
 
 def _last_text(messages: list[dict]) -> str:
@@ -85,10 +92,23 @@ def build(client=None, ctx: tools.Context | None = None):
             update["answer"] = answer
         return update
 
+    def nudge(state: State) -> dict:
+        # A reasoning model can spend its whole completion budget and return no
+        # content and no call. One bounded re-prompt keeps the episode alive.
+        return {"messages": state["messages"] + [
+                    {"role": "user", "content": policy.EMPTY_TURN_NUDGE}],
+                "empty_retries": state.get("empty_retries", 0) + 1}
+
     def after_agent(state: State) -> str:
+        last = state["messages"][-1]
         # The cap is enforced in after_tools, so the last call still gets its
         # result: a trace that ends on an unanswered call says nothing.
-        return "tools" if state["messages"][-1].get("tool_calls") else END
+        if last.get("tool_calls"):
+            return "tools"
+        if (not _empty_reply(last) or state["turns"] >= policy.MAX_TURNS
+                or state.get("empty_retries", 0) >= policy.EMPTY_TURN_RETRIES):
+            return END
+        return "nudge"
 
     def after_tools(state: State) -> str:
         if state.get("answer") is not None:
@@ -100,9 +120,11 @@ def build(client=None, ctx: tools.Context | None = None):
     graph = StateGraph(State)
     graph.add_node("agent", agent)
     graph.add_node("tools", act)
+    graph.add_node("nudge", nudge)
     graph.set_entry_point("agent")
-    graph.add_conditional_edges("agent", after_agent, ["tools", END])
+    graph.add_conditional_edges("agent", after_agent, ["tools", "nudge", END])
     graph.add_conditional_edges("tools", after_tools, ["agent", END])
+    graph.add_edge("nudge", "agent")
     return graph.compile()
 
 
@@ -111,7 +133,7 @@ def run(task: str, client, ctx: tools.Context) -> dict:
     state = build(client, ctx).invoke(
         {"messages": [{"role": "system", "content": prompts.SYSTEM},
                       {"role": "user", "content": task}],
-         "turns": 0},
+         "turns": 0, "empty_retries": 0},
         {"recursion_limit": 2 * policy.MAX_TURNS + 5})
     state["answer"] = state.get("answer") or _last_text(state["messages"]) or "UNKNOWN"
     return state
