@@ -24,13 +24,17 @@ A missing trial is reward 0 with the full denominator, never a skipped slot.
 Isolation
 ---------
 ``run()`` starts one container per episode from ``rrsi.json["sandbox_image"]``.
-Only four things are visible inside it:
+Only these things are visible inside it:
 
-* the candidate's ``domains/agora`` tree, read-only at ``/app/agora``;
+* the candidate's ``harness/`` directory, read-only at ``/app/agora/harness``;
+* the frozen runtime ``cli.py``, ``tasks.py`` and ``index/``, read-only;
 * the task's own domain corpus, read-only at ``/data/documents/<domain>``;
 * one redacted task row (gold answer blanked) at ``/data/tasks``;
 * the task's own FTS5 index file, read-only at ``/index``;
 * the trial output directory, writable at ``/out``.
+
+The split, the scorer and the adapter are not mounted, so the agent cannot
+read the evolve/heldout lists or the normalizer at runtime.
 
 The container is non-root, read-only, without capabilities, with a tmpfs
 ``/tmp``. ``--network host`` is required because the policy endpoint runs on
@@ -337,7 +341,14 @@ class AgoraDomain(Domain):
             "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges",
             "--tmpfs", "/tmp:rw,size=2g,mode=1777",
-            "--volume", f"{Path(root) / 'domains' / 'agora'}:/app/agora:ro",
+            "--volume", f"{Path(root) / 'domains' / 'agora' / 'harness'}"
+                        f":/app/agora/harness:ro",
+            "--volume", f"{Path(root) / 'domains' / 'agora' / 'index'}"
+                        f":/app/agora/index:ro",
+            "--volume", f"{Path(root) / 'domains' / 'agora' / 'cli.py'}"
+                        f":/app/agora/cli.py:ro",
+            "--volume", f"{Path(root) / 'domains' / 'agora' / 'tasks.py'}"
+                        f":/app/agora/tasks.py:ro",
             "--volume", f"{docs}:/data/documents/{task.domain}:ro",
             "--volume", f"{task_file}:/data/tasks/{task_file.name}:ro",
             "--volume", f"{index}:/index/{index.name}:ro",
