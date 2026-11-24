@@ -144,6 +144,15 @@ def test_critic_patterns_cover_task_gold_reference_domain_and_url(corpus):
     assert any("grader" in hit for hit in hits)
 
 
+def test_constitution_and_briefs_are_present():
+    skill, patterns = DOMAIN.constitution(ROOT)
+    assert "Proposer Constitution" in skill
+    assert "P1." in patterns
+    assert set(DOMAIN.briefs) == {"analyst", "digester", "proposer", "critic"}
+    for text in DOMAIN.briefs.values():
+        assert len(text) > 200
+
+
 def test_component_signals_map_every_diff_family():
     cases = {
         "prompt": '-SYSTEM = "old"\n+SYSTEM = "new"\n',
