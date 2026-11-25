@@ -78,10 +78,10 @@ combine them. Keep the one frozen `index/search.py` path.
 
 ## P3. Search loop without reading a document
 
-**Status:** the baseline cap is now 60 turns (PLAN §11), so the loop stops
-earlier. The pattern is unchanged: the issue 12 smoke task was `UNKNOWN` at 400
-turns, and baseline job `base` timed out on 41/48 trials. The 60-turn cap bounds
-the cost; it does not fix the loop.
+**Status:** the baseline cap is now 100 turns, so the loop stops earlier than
+the 400-turn diagnostic. The pattern is unchanged: the issue 12 smoke task was
+`UNKNOWN` at 400 turns, and baseline job `base` timed out on 41/48 trials. The
+100-turn cap bounds the cost; it does not fix the loop.
 
 **Mechanism.** The agent repeats or rewords searches and treats snippets as the
 document. It never calls `read_file`, so the line range and the table that
