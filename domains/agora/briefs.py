@@ -37,11 +37,11 @@ separately from a wrong value.
 """
 
 DIGESTER = """The trajectory comes from a LangGraph agent that answers one
-Agora question with five tools: search_docs (BM25 over one domain index),
-read_file, grep, python (pandas, numpy, scipy), and answer. The final answer
-ends the episode. Each rendered trace holds the system prompt, the question,
-every tool call and result, the final value, the gold value and the exact-match
-result.
+Agora question with five tools: search_docs (hybrid BM25 + EmbeddingGemma 2
+retrieval over one domain index), read_file, grep, python (pandas, numpy,
+scipy), and answer. The final answer ends the episode. Each rendered trace
+holds the system prompt, the question, every tool call and result, the final
+value, the gold value and the exact-match result.
 
 Read the result block first. Then inspect the last assistant message: if it has
 no content and no tool call, the episode ended without an answer, and the
@@ -100,9 +100,9 @@ correct answer, so do not claim a success habit it did not show.
 CRITIC = """The harness answers Agora document questions with search_docs,
 read_file, grep, python and answer. The policy model is frozen. Evaluation runs
 inside a read-only container with only the task's domain corpus, one redacted
-task row and that domain's FTS5 index mounted. The exact-match scorer, the task
-loader, the split and the index builder live outside the evolvable harness and
-cannot be changed.
+task row, that domain's hybrid index and the EmbeddingGemma 2 text tower
+mounted. The exact-match scorer, the task loader, the split and the index
+builder live outside the evolvable harness and cannot be changed.
 
 Reject any diff that adds a network client, URL, endpoint or credential; any
 task id, gold value, reference file path, domain name or per-task branch; any

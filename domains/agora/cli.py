@@ -11,8 +11,8 @@ skipped and the exit code is 0. A failed episode writes a partial
 ``trajectory.json``, leaves ``answer.txt`` absent (so the adapter retries it)
 and exits non-zero.
 
-Env: ``AGORA_DATA``, ``AGORA_INDEX``, ``AGORA_DOMAIN``, ``AGORA_MODEL``,
-``OPENAI_BASE_URL``, ``OPENAI_API_KEY``.
+Env: ``AGORA_DATA``, ``AGORA_INDEX``, ``AGORA_EMBEDDER``, ``AGORA_DOMAIN``,
+``AGORA_MODEL``, ``OPENAI_BASE_URL``, ``OPENAI_API_KEY``.
 """
 
 from __future__ import annotations

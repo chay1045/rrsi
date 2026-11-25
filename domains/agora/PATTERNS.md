@@ -49,10 +49,12 @@ policy's reasoning. Do not add an unbounded retry loop.
 
 ## P2. Long query dilutes BM25
 
-**Mechanism.** `search_docs` passes the query to `search.match_expression`. That
-function removes stopwords and joins every remaining term with `OR`. A
-question-shaped query therefore matches many documents through common terms,
-and the rare terms that identify the evidence do not dominate the rank.
+**Mechanism.** `search_docs` runs BM25 and dense retrieval, then fuses them with
+reciprocal rank fusion. On the BM25 side, `search.match_expression` removes
+stopwords and joins every remaining term with `OR`. A question-shaped query
+therefore matches many documents through common terms, and the rare terms that
+identify the evidence do not dominate the BM25 rank. The dense side can still
+recover the right passage, but a diluted fusion is a weak starting point.
 
 **Evidence.**
 - task: `Agriculture, Resources & Energy/q_0030`

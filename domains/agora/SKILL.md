@@ -57,7 +57,7 @@ mechanics. Prefer a mechanism over motivational wording.
 These parts are frozen and live outside the evolvable directory:
 
 - `cli.py`, `tasks.py`, `score.py`, `split.py`, `adapter.py`;
-- `index/` — the chunker, the FTS5 builder and the one BM25 query path;
+- `index/` — the chunker, the EmbeddingGemma 2 embedder, the FTS5 + sqlite-vec builder and the one hybrid query path;
 - `data/split.json` and its hash;
 - `sandbox/` and the container image;
 - the eval, scoring and selection code in RRSI.

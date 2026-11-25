@@ -1,6 +1,10 @@
-"""Agora index builder: chunk markdown and tables, one SQLite FTS5 db per domain.
+"""Agora index builder: chunk markdown and tables, one hybrid SQLite db per domain.
 
-    python3 domains/agora/index/build.py --domain "Finance & Economics"
+    python3 domains/agora/index/build.py --domain "Finance & Economics" --embed
+
+The default build writes the FTS5 table only. ``--embed`` also writes 256d
+EmbeddingGemma 2 vectors to the sqlite-vec ``chunk_vectors`` table, which the
+hybrid query path needs.
 
 Not evolvable (PLAN.md appendix B): RRSI candidates run in git worktrees of this
 repo and must never read or edit the index or its builder. The index lives in an
@@ -15,6 +19,7 @@ import csv
 import io
 import os
 import re
+import resource
 import sqlite3
 import time
 import zipfile
@@ -24,6 +29,8 @@ from pathlib import Path
 
 import openpyxl
 from openpyxl.utils import get_column_letter
+
+from embed import DIMS, Embedder, EmbeddingGemma, check_vectors
 
 DATA_DIR = Path(os.environ.get("AGORA_DATA", Path.home() / "work" / "agora-data"))
 DOCS_DIR = DATA_DIR / "documents"
@@ -55,6 +62,17 @@ CREATE TABLE chunks (
 CREATE VIRTUAL TABLE chunks_fts USING fts5(
     text, cjk, content='chunks', content_rowid='chunk_id', tokenize='porter unicode61');
 """
+
+VECTOR_SCHEMA = f"""
+DROP TABLE IF EXISTS chunk_vectors;
+CREATE VIRTUAL TABLE chunk_vectors USING vec0(
+    chunk_id INTEGER PRIMARY KEY,
+    embedding float[{DIMS}] distance_metric=cosine
+);
+"""
+
+VECTOR_BATCH = 128  # chunks per encode call; keeps peak memory flat
+PROGRESS_CHUNKS = 10_000  # one line every N chunks so a long embed is observable
 
 
 @dataclass(frozen=True)
@@ -263,9 +281,47 @@ def _slug(domain: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", domain.lower()).strip("-")
 
 
+def load_vec(con: sqlite3.Connection) -> None:
+    """Load the sqlite-vec extension on this connection, once."""
+    try:
+        con.execute("SELECT vec_version()").fetchone()
+        return
+    except sqlite3.OperationalError:
+        pass
+    try:
+        import sqlite_vec
+    except ImportError as exc:
+        raise RuntimeError(
+            "sqlite-vec is not installed; pip install sqlite-vec") from exc
+    con.enable_load_extension(True)
+    sqlite_vec.load(con)
+    con.enable_load_extension(False)
+
+
+def _write_vectors(con: sqlite3.Connection, embedder: Embedder,
+                   pending: list[tuple[int, str, str]]) -> None:
+    """Embed one batch and insert it. Raises before a poisoned row is written."""
+    if int(getattr(embedder, "dims", 0)) != DIMS:
+        raise ValueError(f"embedder dims {getattr(embedder, 'dims', None)}, expected {DIMS}")
+    texts = [text for _, _, text in pending]
+    titles = [title for _, title, _ in pending]
+    vectors = check_vectors(embedder.encode_documents(texts, titles), len(pending))
+    con.executemany(
+        "INSERT INTO chunk_vectors (chunk_id, embedding) VALUES (?, ?)",
+        [(chunk_id, vector.tobytes())
+         for (chunk_id, _, _), vector in zip(pending, vectors)])
+
+
 def build_domain(domain: str, docs_dir: Path = DOCS_DIR,
-                 index_dir: Path = INDEX_DIR) -> tuple[dict[str, int], int, Path]:
-    """(re)build one domain's index from scratch; return (file counts, chunks, db)."""
+                 index_dir: Path = INDEX_DIR,
+                 embedder: Embedder | None = None
+                 ) -> tuple[dict[str, int], int, Path]:
+    """(re)build one domain's index from scratch; return (file counts, chunks, db).
+
+    With ``embedder``, also write 256d document vectors to the ``chunk_vectors``
+    sqlite-vec table. The vector batch is finite-checked before insertion; a
+    NaN or Inf aborts the build and leaves the previous database untouched.
+    """
     root = Path(docs_dir) / domain
     if not root.is_dir():
         raise SystemExit(f"no domain directory: {root}")
@@ -277,24 +333,49 @@ def build_domain(domain: str, docs_dir: Path = DOCS_DIR,
 
     counts = {"md": 0, "xlsx": 0, "csv": 0}
     total = 0
+    next_id = 1
+    reported = 0
+    started_domain = time.perf_counter()
+    pending: list[tuple[int, str, str]] = []
     con = sqlite3.connect(tmp_path)
     try:
         con.executescript(SCHEMA)
+        if embedder is not None:
+            load_vec(con)
+            con.executescript(VECTOR_SCHEMA)
         for path in sorted(p for p in root.rglob("*") if p.is_file()):
             kind = SUFFIXES.get(path.suffix.lower())
             if kind is None:
                 continue
             doc_path = f"documents/{domain}/{path.relative_to(root).as_posix()}"
-            rows = [(domain, doc_path, c.line_start, c.line_end, c.heading_path,
-                     c.text, cjk_split(c.text))
-                    for c in chunks(list(_units(path)))]
+            rows = []
+            for chunk in chunks(list(_units(path))):
+                rows.append((next_id, domain, doc_path, chunk.line_start,
+                             chunk.line_end, chunk.heading_path, chunk.text,
+                             cjk_split(chunk.text)))
+                if embedder is not None:
+                    pending.append((next_id, chunk.heading_path, chunk.text))
+                next_id += 1
             con.executemany(
-                "INSERT INTO chunks (domain, doc_path, line_start, line_end, heading_path,"
-                " text, cjk) VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+                "INSERT INTO chunks (chunk_id, domain, doc_path, line_start,"
+                " line_end, heading_path, text, cjk)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
             counts[kind] += 1
             total += len(rows)
+            if embedder is not None and len(pending) >= VECTOR_BATCH:
+                _write_vectors(con, embedder, pending)
+                pending.clear()
+            if embedder is not None and total // PROGRESS_CHUNKS > reported:
+                reported = total // PROGRESS_CHUNKS
+                print(f"{domain}: {total} chunks in "
+                      f"{time.perf_counter() - started_domain:.0f}s", flush=True)
+        if pending:
+            _write_vectors(con, embedder, pending)
         con.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')")
         con.commit()
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
     finally:
         con.close()
     tmp_path.replace(db_path)
@@ -307,6 +388,8 @@ def main(argv: list[str] | None = None) -> None:
                     help="exact domain directory name; repeatable; default: all")
     ap.add_argument("--docs-dir", type=Path, default=DOCS_DIR)
     ap.add_argument("--index-dir", type=Path, default=INDEX_DIR)
+    ap.add_argument("--embed", action="store_true",
+                    help="also write 256d EmbeddingGemma 2 vectors (sqlite-vec)")
     args = ap.parse_args(argv)
 
     if not args.docs_dir.is_dir():
@@ -317,20 +400,29 @@ def main(argv: list[str] | None = None) -> None:
         if domain not in all_domains:
             ap.error(f"unknown domain {domain!r}; choose from: {', '.join(all_domains)}")
 
+    embedder = EmbeddingGemma() if args.embed else None
+    if embedder is not None:
+        print(embedder.describe(), flush=True)
+
+    started_all = time.perf_counter()
     totals = {"md": 0, "xlsx": 0, "csv": 0}
     total_chunks = 0
     for domain in domains:
         started = time.perf_counter()
-        counts, n_chunks, db_path = build_domain(domain, args.docs_dir, args.index_dir)
+        counts, n_chunks, db_path = build_domain(
+            domain, args.docs_dir, args.index_dir, embedder)
         elapsed = time.perf_counter() - started
         print(f"{domain}: {counts['md']} md + {counts['xlsx']} xlsx + {counts['csv']} csv"
-              f" -> {n_chunks} chunks in {elapsed:.1f}s -> {db_path}")
+              f" -> {n_chunks} chunks in {elapsed:.1f}s -> {db_path}", flush=True)
         for kind in totals:
             totals[kind] += counts[kind]
         total_chunks += n_chunks
     if len(domains) > 1:
+        elapsed = time.perf_counter() - started_all
+        peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
         print(f"total: {totals['md']} md + {totals['xlsx']} xlsx + {totals['csv']} csv"
-              f" -> {total_chunks} chunks in {len(domains)} domains")
+              f" -> {total_chunks} chunks in {len(domains)} domains,"
+              f" {elapsed:.1f}s, peak RSS {peak_mb:.0f} MiB", flush=True)
 
 
 if __name__ == "__main__":

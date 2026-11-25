@@ -72,3 +72,23 @@ def test_report_scores_and_verdict():
     assert "| **all** | 4 | 0.750 | 0.750 | 0.750 |" in markdown
     assert "PASS" in markdown and "Gate 2" in markdown
     assert "#14" in markdown  # the verdict names the next experiment
+
+
+def test_rrf_prefers_a_chunk_that_both_rankers_found():
+    both = (1, "documents/Law/a.md", 1, 1)
+    bm25_only = (2, "documents/Law/b.md", 1, 1)
+    dense_only = (3, "documents/Law/c.md", 1, 1)
+    fused = search.reciprocal_rank_fusion(
+        [[bm25_only, both], [dense_only, both]], k=3)
+    assert fused[0] == both
+    assert {hit[0] for hit in fused} == {1, 2, 3}
+
+
+def test_ablation_report_records_the_expected_order_and_verdict():
+    good = {"A": [(1, 1)] * 2}
+    weak = {"A": [(None, None)] * 2}
+    runs = {"bm25": (weak, 1.0), "dense": (good, 2.0), "hybrid": (good, 3.0)}
+    markdown = evaluate.ablation_report(runs, 6.0)
+    assert "| hybrid | 2 | 1.000 | 1.000 | 1.000 | 3 |" in markdown
+    assert "Ablation ordering holds" in markdown
+    assert "PASS" in markdown

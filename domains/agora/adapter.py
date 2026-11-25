@@ -30,7 +30,8 @@ Only these things are visible inside it:
 * the frozen runtime ``cli.py``, ``tasks.py`` and ``index/``, read-only;
 * the task's own domain corpus, read-only at ``/data/documents/<domain>``;
 * one redacted task row (gold answer blanked) at ``/data/tasks``;
-* the task's own FTS5 index file, read-only at ``/index``;
+* the task's own hybrid index file, read-only at ``/index``;
+* the EmbeddingGemma 2 text tower, read-only at ``/models/embeddinggemma2``;
 * the trial output directory, writable at ``/out``.
 
 The split, the scorer and the adapter are not mounted, so the agent cannot
@@ -72,6 +73,8 @@ DATA_DIR = Path(os.environ.get("AGORA_DATA", Path.home() / "work" / "agora-data"
 INDEX_DIR = Path(os.environ.get("AGORA_INDEX") or (
     Path(os.environ.get("RRSI_CACHE_DIR", Path.home() / ".cache" / "rrsi"))
     / "agora" / "index"))
+EMBEDDER_DIR = Path(os.environ.get("AGORA_EMBEDDER") or (
+    Path.home() / "Models" / "embeddinggemma2"))
 AGENT_PY = os.environ.get("RRSI_AGENT_PYTHON", sys.executable)
 SOURCE_EXTS = {".py", ".txt", ".md", ".json"}
 _TRACE_CAP = 300_000
@@ -88,6 +91,7 @@ _GUARD_PATTERNS = [
     (re.compile(r"\bAPI_BASE\b"), "API_BASE endpoint"),
     (re.compile(r"\bapi[_-]?key\b", re.IGNORECASE), "credential reference"),
     (re.compile(r"\bAGORA_INDEX\b"), "index path override"),
+    (re.compile(r"\bAGORA_EMBEDDER\b"), "embedder path override"),
     (re.compile(r"(?<![\w])/out(?:/|\b)"), "grader output path"),
     (re.compile(r"\banswer\.txt\b"), "grader answer file"),
     (re.compile(r"\btrajectory\.json\b"), "grader trajectory file"),
@@ -281,6 +285,12 @@ class AgoraDomain(Domain):
             _log(log_path, f"{log_prefix}{job}: harness guard violations: "
                            f"{'; '.join(violations)}")
 
+        embedder = EMBEDDER_DIR.resolve()
+        if not embedder.is_dir():
+            raise FileNotFoundError(
+                f"missing embedder for hybrid retrieval: {embedder}; set "
+                f"AGORA_EMBEDDER or install the model under ~/Models")
+
         episodes: list[tuple] = []
         for task_id in ids:
             task = _task(task_id)
@@ -352,9 +362,13 @@ class AgoraDomain(Domain):
             "--volume", f"{docs}:/data/documents/{task.domain}:ro",
             "--volume", f"{task_file}:/data/tasks/{task_file.name}:ro",
             "--volume", f"{index}:/index/{index.name}:ro",
+            "--volume", f"{EMBEDDER_DIR.resolve()}:/models/embeddinggemma2:ro",
             "--volume", f"{Path(out)}:/out",
             "--env", "AGORA_DATA=/data",
             "--env", "AGORA_INDEX=/index",
+            "--env", "AGORA_EMBEDDER=/models/embeddinggemma2",
+            "--env", "HF_HUB_OFFLINE=1",
+            "--env", "TRANSFORMERS_OFFLINE=1",
             "--env", "PYTHONUNBUFFERED=1",
             "--env", "PYTHONDONTWRITEBYTECODE=1",
             "--env", "HOME=/tmp",
@@ -586,6 +600,7 @@ def _build_critic_patterns() -> list:
         (r"\bOPENAI_[A-Za-z0-9_]*\b", "OpenAI environment variable in diff"),
         (r"\bAPI_BASE\b", "API_BASE endpoint in diff"),
         (r"(?i)\bAGORA_INDEX\b", "index path override in diff"),
+        (r"(?i)\bAGORA_EMBEDDER\b", "embedder path override in diff"),
         (r"(?<![\w])/out(?:/|\b)", "grader output path in diff"),
         (r"(?i)\banswer\.txt\b", "grader answer file in diff"),
         (r"(?i)\btrajectory\.json\b", "grader trajectory file in diff"),

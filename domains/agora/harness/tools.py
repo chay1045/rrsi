@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 # The index modules are siblings and are imported the way evaluate.py imports
-# them: by path, so the tool queries the same FTS5 path Gate 2 measured.
+# them: by path, so the tool queries the same hybrid retrieval path Gate 2 measures.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "index"))
 import search as index_search  # noqa: E402
 
@@ -55,7 +55,7 @@ def search_docs(query: str, k: int | None = None, ctx: Context = None) -> str:
     k = min(max(int(k or policy.K), 1), policy.K)
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
-        hits = index_search.search(con, query, k)
+        hits = index_search.hybrid_search(con, query, k)
         blocks = []
         for position, (doc_path, line_start, line_end) in enumerate(hits, 1):
             row = con.execute(
@@ -153,9 +153,9 @@ def _spec(name: str, description: str, properties: dict, required: list[str]) ->
 
 SPECS = [
     _spec("search_docs",
-          "Full-text search over the domain's documents. Returns path, line "
-          "range and a short snippet per hit.",
-          {"query": {"type": "string", "description": "keywords, not a question"},
+          "Hybrid keyword and semantic search over the domain's documents. "
+          "Returns path, line range and a short snippet per hit.",
+          {"query": {"type": "string", "description": "what to find, in the question's terms"},
            "k": {"type": "integer", "description": f"hits (default {policy.K})"}},
           ["query"]),
     _spec("read_file",
