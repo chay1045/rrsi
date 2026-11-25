@@ -5,8 +5,9 @@ tokenizer, and 4 chars/token keeps the estimate one line.
 """
 
 K = 5                    # search_docs hits per call
-MAX_TURNS = 400          # model calls per episode (PLAN §3.2 measured ~60; raised
-                         # while the loop still fails to answer, to see it flail)
+MAX_TURNS = 60           # model calls per episode (PLAN §11 deviation). 400 was
+                         # a diagnostic; it made 41 of 48 baseline trials exceed
+                         # the 3600 s cap, so the planned 60 is the baseline cap.
 TEMPERATURE = 1.0        # Agora's official setting; cli.py passes these two
 MAX_TOKENS = 4096        # to the endpoint when it wraps the client. 1024 cut the
                          # reasoning short and produced empty assistant turns.
