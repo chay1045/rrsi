@@ -103,6 +103,11 @@ def build(client=None, ctx: tools.Context | None = None):
             name = call["function"]["name"]
             try:
                 args = json.loads(call["function"].get("arguments") or "{}")
+                if isinstance(args, dict):
+                    # Some providers leak whitespace into argument keys, e.g.
+                    # ``" path"``. The tool names are fixed, so normalize keys
+                    # before dispatch instead of failing on the keyword.
+                    args = {str(key).strip(): value for key, value in args.items()}
                 if name == "answer":
                     answer = str(args.get("value") or "").strip()
                     output = "episode finished"

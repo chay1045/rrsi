@@ -269,6 +269,98 @@ def test_read_file_stays_inside_the_domain_docs(tmp_path):
         tools.read_file("../../etc/passwd", 1, 2, ctx=ctx)
 
 
+@pytest.mark.parametrize("path", [
+    "a.md",
+    "D/a.md",
+    "documents/a.md",
+    "documents/D/a.md",
+    "/data/documents/D/a.md",
+    "D/D/a.md",
+    "documents/D/D/a.md",
+])
+def test_read_file_accepts_every_document_path_form(tmp_path, path):
+    docs = tmp_path / "documents" / "D"
+    docs.mkdir(parents=True)
+    (docs / "a.md").write_text("one\ntwo\n", encoding="utf-8")
+    ctx = tools.Context("D", data_dir=tmp_path)
+    assert "two" in tools.read_file(path, 1, 2, ctx=ctx)
+
+
+@pytest.mark.parametrize("path", [
+    "/other/D/a.md",
+    "/data/documents/Other/a.md",
+    "../../etc/passwd",
+    "documents/../../etc/passwd",
+    "documents/D/../../../etc/passwd",
+])
+def test_read_file_rejects_paths_outside_the_domain(tmp_path, path):
+    (tmp_path / "documents" / "D").mkdir(parents=True)
+    ctx = tools.Context("D", data_dir=tmp_path)
+    with pytest.raises(ValueError):
+        tools.read_file(path, 1, 2, ctx=ctx)
+
+
+def test_grep_accepts_a_single_file_path(tmp_path):
+    docs = tmp_path / "documents" / "D"
+    (docs / "sub").mkdir(parents=True)
+    (docs / "a.md").write_text("needle\n", encoding="utf-8")
+    (docs / "b.csv").write_text("needle\n", encoding="utf-8")
+    (docs / "sub" / "c.md").write_text("needle\n", encoding="utf-8")
+    ctx = tools.Context("D", data_dir=tmp_path)
+
+    out = tools.grep("needle", path="documents/D/a.md", ctx=ctx)
+
+    assert "a.md:1:needle" in out
+    assert "b.csv" not in out and "c.md" not in out
+
+
+def test_grep_maps_a_non_file_path_to_glob(tmp_path):
+    docs = tmp_path / "documents" / "D"
+    (docs / "sub").mkdir(parents=True)
+    (docs / "a.md").write_text("needle\n", encoding="utf-8")
+    (docs / "b.csv").write_text("needle\n", encoding="utf-8")
+    (docs / "sub" / "c.md").write_text("needle\n", encoding="utf-8")
+    ctx = tools.Context("D", data_dir=tmp_path)
+
+    out = tools.grep("needle", path="*.md", ctx=ctx)
+
+    assert "a.md:1:needle" in out
+    assert "sub/c.md:1:needle" in out
+    assert "b.csv" not in out
+
+
+def test_grep_path_cannot_escape_the_domain(tmp_path):
+    (tmp_path / "documents" / "D").mkdir(parents=True)
+    ctx = tools.Context("D", data_dir=tmp_path)
+    with pytest.raises(ValueError):
+        tools.grep("x", path="/etc/passwd", ctx=ctx)
+    with pytest.raises(ValueError):
+        tools.grep("x", path="../../etc/passwd", ctx=ctx)
+
+
+def test_leading_space_argument_key_is_stripped(monkeypatch):
+    seen = {}
+
+    def capture(name, args, ctx):
+        seen.update(args)
+        return "ok"
+
+    monkeypatch.setattr(tools, "dispatch", capture)
+    client = scripted(call("read_file", {" path": "a.md", "start": 1}),
+                      call("answer", {"value": "1"}))
+    graph.run("q", client, CTX)
+    assert seen == {"path": "a.md", "start": 1}
+
+
+@pytest.mark.parametrize("name", ["bash", "shell"])
+def test_unknown_shell_tools_remain_errors(name):
+    client = scripted(call(name, {"command": "ls"}), call("answer", {"value": "1"}))
+    state = graph.run("q", client, CTX)
+    errors = [m["content"] for m in state["messages"] if m["role"] == "tool"]
+    assert errors[0].startswith(f"error: ValueError: unknown tool: {name}")
+    assert state["answer"] == "1"
+
+
 def test_python_sees_documents_only(tmp_path, monkeypatch):
     monkeypatch.delenv("AGORA_SCRATCH", raising=False)
     (tmp_path / "documents" / "D").mkdir(parents=True)

@@ -76,15 +76,42 @@ def search_docs(query: str, k: int | None = None, ctx: Context = None) -> str:
     return "\n\n".join(blocks) or "(no hits)"
 
 
+def _relative_document_path(path: str, ctx: Context) -> str:
+    """Normalize the path forms models send into a path under ``docs_dir``.
+
+    Accepted: ``/data/documents/<domain>/...``, ``documents/<domain>/...``,
+    ``documents/...``, ``<domain>/...`` and a bare relative path. The domain is
+    redundant because ``docs_dir`` already ends with it, so strip it (even
+    when repeated). Any other absolute path is outside the domain.
+    """
+    value = str(path)
+    absolute_root = f"/data/documents/{ctx.domain}"
+    if value == absolute_root or value.startswith(absolute_root + "/"):
+        value = value[len(absolute_root):].lstrip("/")
+    elif value.startswith("/"):
+        raise ValueError(f"path outside the domain documents: {path}")
+    if value.startswith("documents/"):
+        value = value[len("documents/"):]
+    while value.startswith(f"{ctx.domain}/"):
+        value = value[len(ctx.domain) + 1:]
+    if value in {"", ".", "documents", ctx.domain, f"documents/{ctx.domain}"}:
+        value = ""
+    return value
+
+
+def _document_target(path: str, ctx: Context) -> Path:
+    root = Path(ctx.docs_dir).resolve()
+    target = (root / _relative_document_path(path, ctx)).resolve()
+    if not target.is_relative_to(root):
+        raise ValueError(f"path outside the domain documents: {path}")
+    return target
+
+
 def read_file(path: str, start: int = 1, end: int | None = None,
               ctx: Context = None) -> str:
     # Only the domain's documents: DATA_DIR also holds tasks/*.jsonl with the
     # answers, so the root is docs_dir and the search form is stripped first.
-    root = Path(ctx.docs_dir).resolve()
-    prefix = f"documents/{ctx.domain}/"
-    target = (root / (path[len(prefix):] if path.startswith(prefix) else path)).resolve()
-    if not target.is_relative_to(root):
-        raise ValueError(f"path outside the domain documents: {path}")
+    target = _document_target(path, ctx)
     if target.suffix.lower() not in {".md", ".txt", ".csv", ".json"}:
         raise ValueError(f"{path} is not text; use search_docs or python")
     lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -96,15 +123,30 @@ def read_file(path: str, start: int = 1, end: int | None = None,
     return f"{path}:{start}-{stop}\n{text}"
 
 
-def grep(pattern: str, glob: str = "*", ctx: Context = None) -> str:
+def grep(pattern: str, glob: str = "*", path: str | None = None,
+         ctx: Context = None) -> str:
     rg = shutil.which("rg")
     if not rg:
         raise RuntimeError("ripgrep (rg) is not installed")
-    command = [rg, "-n", "--no-heading", "--color", "never",
+    root = Path(ctx.docs_dir).resolve()
+    target = root
+    if path:
+        relative = _relative_document_path(path, ctx)
+        target = (root / relative).resolve()
+        if not target.is_relative_to(root):
+            raise ValueError(f"path outside the domain documents: {path}")
+        if target.is_file():
+            glob = None  # a single file needs no glob filter
+        elif not target.is_dir():
+            # Not a real path: the model meant a filename pattern.
+            glob = relative or glob
+            target = root
+    # A single-file target makes rg omit the filename unless forced.
+    command = [rg, "-n", "--with-filename", "--no-heading", "--color", "never",
                "-m", str(policy.GREP_PER_FILE)]
     if glob:
         command += ["-g", glob]
-    command += ["--", pattern, str(ctx.docs_dir)]
+    command += ["--", pattern, str(target)]
     done = subprocess.run(command, capture_output=True, text=True,
                           errors="replace", timeout=policy.PY_TIMEOUT)
     if done.returncode not in (0, 1):
@@ -220,9 +262,12 @@ SPECS = [
            "end": {"type": "integer", "description": "last line, inclusive"}},
           ["path"]),
     _spec("grep",
-          "Regex search for lines across the domain's documents, with paths.",
+          "Regex search for lines across the domain's documents, with paths. "
+          "Set path to search one file; a glob such as '*.md' is also accepted.",
           {"pattern": {"type": "string", "description": "regular expression"},
-           "glob": {"type": "string", "description": "e.g. '*.md' (default all)"}},
+           "glob": {"type": "string", "description": "e.g. '*.md' (default all)"},
+           "path": {"type": "string",
+                    "description": "one file path or a glob; default all documents"}},
           ["pattern"]),
     PYTHON_SPEC,
     ANSWER_SPEC,

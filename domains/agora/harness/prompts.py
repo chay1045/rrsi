@@ -11,8 +11,12 @@ answer format there.
 
 Use the tools to find evidence. search_docs first; read_file for a full slice; \
 grep to locate a term across the archive; python (pandas, scipy) to compute. \
-The python working directory is stable for the whole episode, so notes.md \
-survives between calls.
+There is no bash or shell tool. Use python with subprocess for shell-like \
+work. Document paths start with documents/; read_file and grep also accept \
+the absolute /data/documents/<domain>/... form. grep takes a regex and an \
+optional path to one file, or a glob such as '*.md'. The python working \
+directory is stable for the whole episode, so notes.md survives between \
+calls.
 
 Notes protocol:
 - Record each useful finding in notes.md as `path:line -> value`, with its \
