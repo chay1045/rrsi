@@ -6,6 +6,8 @@ import sys
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
+import pytest
+
 AGORA = Path(__file__).resolve().parents[1] / "domains" / "agora"
 
 spec = spec_from_file_location("agora_index_evaluate", AGORA / "index" / "evaluate.py")
@@ -92,3 +94,45 @@ def test_ablation_report_records_the_expected_order_and_verdict():
     assert "| hybrid | 2 | 1.000 | 1.000 | 1.000 | 3 |" in markdown
     assert "Ablation ordering holds" in markdown
     assert "PASS" in markdown
+
+
+def test_paired_delta_is_paired_and_bounded():
+    base = {"A": [(None, None), (1, 1)], "B": [(None, None)]}
+    tuned = {"A": [(1, 1), (1, 1)], "B": [(1, 1)]}
+    n, delta, low, high = evaluate.paired_delta(base, tuned, resamples=2000)
+    assert n == 3
+    assert delta == pytest.approx(2 / 3)
+    assert 0.0 <= low <= delta <= high <= 1.0
+
+
+def test_paired_delta_orders_tasks_the_same_way():
+    base = {"A": [(None, None), (1, 1)], "B": [(1, 1)]}
+    tuned = {"A": [(1, 1), (None, None)], "B": [(1, 1)]}
+    _, delta, _, _ = evaluate.paired_delta(base, tuned, resamples=100)
+    assert delta == 0.0
+
+
+def test_ablation_report_records_rerank_delta_and_ci():
+    base = {"A": [(None, None), (1, 1), (2, 2), (None, None)]}
+    tuned = {"A": [(1, 1), (1, 1), (2, 2), (None, None)]}
+    runs = {"hybrid": (base, 1.0), "hybrid+rerank": (tuned, 1.5)}
+    markdown = evaluate.ablation_report(
+        runs, 2.0, rerank_seconds=0.5, rerank_calls=4)
+    assert "Rerank delta: recall_file@10 +0.250" in markdown
+    assert "95% CI" in markdown
+    assert "Score latency: 0.5s over 4 calls (125.0 ms/task)" in markdown
+
+
+def test_rerank_requires_the_hybrid_mode(capsys):
+    with pytest.raises(SystemExit):
+        evaluate.main(["--mode", "bm25", "--rerank"])
+    assert "--mode hybrid" in capsys.readouterr().err
+
+
+def test_ablation_report_marks_the_rerank_as_measured():
+    scored = [(1, None)] * 5 + [(1, 1)] * 3 + [(None, None)] * 2
+    runs = {"hybrid": ({"A": scored}, 1.0),
+            "hybrid+rerank": ({"A": list(scored)}, 1.0)}
+    markdown = evaluate.ablation_report(runs, 2.0)
+    assert "measured below" in markdown
+    assert "worth measuring" not in markdown

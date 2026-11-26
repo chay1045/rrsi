@@ -6,6 +6,10 @@ Modes: ``bm25``, ``dense`` and ``hybrid``. Repeat ``--mode`` to write one
 ablation report. Dense and hybrid need ``build.py --embed`` and the local
 EmbeddingGemma 2 text tower.
 
+``--rerank`` adds a ``hybrid+rerank`` run next to ``hybrid``: the RRF top-50 is
+rescored by the Qwen3-Reranker service (issue #15), and the report states the
+recall delta, a paired-bootstrap confidence interval and the score latency.
+
 For every task, retrieve the top-10 chunks from the domain's index and score:
 
     recall_file@10    a retrieved chunk's doc_path is one of the task's reference_files
@@ -21,6 +25,7 @@ back to the same and the report says so.
 from __future__ import annotations
 
 import argparse
+import random
 import re
 import sqlite3
 import sys
@@ -31,7 +36,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build  # same directory, shares INDEX_DIR/DATA_DIR
 from search import (DEPTH, K, bm25_chunks, dense_chunks, hybrid_chunks,  # noqa: F401
-                    match_expression, search)
+                    default_reranker, match_expression, search)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import tasks as agora_tasks  # noqa: E402  (path insert must come first)
@@ -97,7 +102,8 @@ def ranks(hits: list[tuple[str, int, int]], refs: list[dict],
 def evaluate(domains: list[str],
              all_tasks: dict[tuple[str, str], agora_tasks.Task],
              mode: str = "bm25", embedder=None,
-             depth: int = DEPTH) -> dict[str, list[tuple[int | None, int | None]]]:
+             depth: int = DEPTH, reranker=None
+             ) -> dict[str, list[tuple[int | None, int | None]]]:
     if mode not in MODES:
         raise ValueError(f"unknown mode {mode!r}; choose from {', '.join(MODES)}")
     if mode != "bm25" and embedder is None:
@@ -122,7 +128,8 @@ def evaluate(domains: list[str],
                 elif mode == "dense":
                     found = dense_chunks(con, vectors[position], K)
                 else:
-                    found = hybrid_chunks(con, task.query, vectors[position], K, depth)
+                    found = hybrid_chunks(con, task.query, vectors[position], K,
+                                          depth, reranker)
                 hits = [(doc_path, line_start, line_end)
                         for _, doc_path, line_start, line_end in found]
                 scored.append(ranks(hits, task.refs, cache))
@@ -149,6 +156,52 @@ def _overall(per_domain: dict[str, list[tuple[int | None, int | None]]]
     regions = sum(1 for _, region_rank in everything if region_rank is not None) / n
     mrr = sum(1 / file_rank for file_rank, _ in everything if file_rank is not None) / n
     return files, regions, mrr
+
+
+class TimedReranker:
+    """Reranker proxy that times only the ``/score`` calls."""
+
+    def __init__(self, reranker):
+        self.reranker = reranker
+        self.seconds = 0.0
+        self.calls = 0
+
+    def score(self, query: str, documents: list[str]) -> list[float]:
+        started = time.perf_counter()
+        try:
+            return self.reranker.score(query, documents)
+        finally:
+            self.seconds += time.perf_counter() - started
+            self.calls += 1
+
+
+def paired_delta(per_domain: dict[str, list[tuple[int | None, int | None]]],
+                 other: dict[str, list[tuple[int | None, int | None]]],
+                 resamples: int = 10_000, seed: int = 0
+                 ) -> tuple[int, float, float, float]:
+    """Observed change in file recall and its paired-bootstrap 95% CI.
+
+    Both mappings are flattened in the same domain/task order, so each task is
+    compared with itself. A rank is 1 for a file hit and 0 for a miss; the
+    percentile interval comes from resampling those paired differences.
+    """
+    base = [1 if file_rank is not None else 0
+            for scored in per_domain.values() for file_rank, _ in scored]
+    tuned = [1 if file_rank is not None else 0
+             for scored in other.values() for file_rank, _ in scored]
+    if len(base) != len(tuned):
+        raise ValueError(f"paired run has {len(tuned)} tasks, expected {len(base)}")
+    if not base:
+        raise ValueError("no tasks to compare")
+    deltas = [after - before for before, after in zip(base, tuned)]
+    observed = sum(deltas) / len(deltas)
+    rng = random.Random(seed)
+    samples = sorted(
+        sum(deltas[rng.randrange(len(deltas))] for _ in deltas) / len(deltas)
+        for _ in range(resamples))
+    low = samples[int(0.025 * resamples)]
+    high = samples[int(0.975 * resamples) - 1]
+    return len(deltas), observed, low, high
 
 
 def report(per_domain: dict[str, list[tuple[int | None, int | None]]], mode: str,
@@ -198,7 +251,8 @@ def report(per_domain: dict[str, list[tuple[int | None, int | None]]], mode: str
 
 def ablation_report(runs: dict[str, tuple[dict[str, list[tuple[int | None, int | None]]],
                                           float]],
-                    elapsed: float) -> str:
+                    elapsed: float, rerank_seconds: float = 0.0,
+                    rerank_calls: int = 0) -> str:
     """One report for repeated ``--mode`` flags: summary, per-domain tables, verdict."""
     first = next(iter(runs.values()))[0]
     tasks = sum(len(scored) for scored in first.values())
@@ -242,9 +296,11 @@ def ablation_report(runs: dict[str, tuple[dict[str, list[tuple[int | None, int |
                 "embedder, or record the plateau; do not run agents against retrieval "
                 "you do not trust.")
         elif hybrid[1] < GATE:
+            next_step = ("measured below" if "hybrid+rerank" in metrics
+                         else "worth measuring")
             lines.append(
                 f"File recall clears the gate but region recall does not "
-                f"({hybrid[1]:.3f}); #15 (reranker) is worth measuring.")
+                f"({hybrid[1]:.3f}); #15 (reranker) is {next_step}.")
         else:
             lines.append("Hybrid clears both file and region recall at the gate.")
         expected = [m for m in ("bm25", "dense", "hybrid") if m in metrics]
@@ -261,6 +317,28 @@ def ablation_report(runs: dict[str, tuple[dict[str, list[tuple[int | None, int |
         else:
             lines.append("Ablation ordering holds on all three metrics: "
                          "hybrid >= dense-only >= BM25.")
+
+    rerank = metrics.get("hybrid+rerank")
+    if rerank is not None and hybrid is not None:
+        n, delta, low, high = paired_delta(
+            runs["hybrid"][0], runs["hybrid+rerank"][0])
+        if low > 0:
+            verdict = "The interval excludes zero: rerank improves file recall."
+        elif high < 0:
+            verdict = "The interval excludes zero: rerank reduces file recall."
+        else:
+            verdict = ("The interval includes zero: the file-recall change is not "
+                       "distinguishable from noise.")
+        latency = (f"{rerank_seconds:.1f}s over {rerank_calls} calls "
+                   f"({1000 * rerank_seconds / n:.1f} ms/task)")
+        lines += [
+            "",
+            f"Rerank delta: recall_file@10 {delta:+.3f}, 95% CI "
+            f"[{low:+.3f}, {high:+.3f}] (paired bootstrap, n={n}, "
+            f"10000 resamples). {verdict}",
+            f"recall_region@10 {rerank[1] - hybrid[1]:+.3f}; "
+            f"MRR@10 {rerank[2] - hybrid[2]:+.3f}. Score latency: {latency}.",
+        ]
     lines.append("")
     lines.append(
         "Caveat: gold pages are mapped to lines through `<!-- pages a-b -->` markers; "
@@ -276,7 +354,13 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--domain", action="append",
                         help="repeatable; default: every domain with tasks")
     parser.add_argument("--out", type=Path, help="write the markdown here, default stdout")
+    parser.add_argument("--rerank", action="store_true",
+                        help="also run hybrid+rerank (needs scripts/serve_rerank.sh)")
     args = parser.parse_args(argv)
+
+    modes = list(dict.fromkeys(args.mode or ("hybrid" if args.rerank else ["bm25"])))
+    if args.rerank and "hybrid" not in modes:
+        parser.error("--rerank needs the hybrid mode; add --mode hybrid")
 
     all_tasks = agora_tasks.load_tasks()
     known = sorted({task.domain for task in all_tasks.values()})
@@ -285,12 +369,14 @@ def main(argv: list[str] | None = None) -> None:
     if unknown:
         parser.error(f"unknown domain(s): {', '.join(unknown)}")
 
-    modes = list(dict.fromkeys(args.mode or ["bm25"]))
     embedder = None
     if any(mode != "bm25" for mode in modes):
         from embed import EmbeddingGemma
         embedder = EmbeddingGemma()
         print(embedder.describe(), file=sys.stderr)
+    reranker = TimedReranker(default_reranker()) if args.rerank else None
+    if reranker is not None:
+        print(reranker.reranker.describe(), file=sys.stderr)
 
     started = time.perf_counter()
     runs: dict[str, tuple[dict[str, list[tuple[int | None, int | None]]], float]] = {}
@@ -298,12 +384,20 @@ def main(argv: list[str] | None = None) -> None:
         mode_started = time.perf_counter()
         per_domain = evaluate(domains, all_tasks, mode=mode, embedder=embedder)
         runs[mode] = (per_domain, time.perf_counter() - mode_started)
+    if reranker is not None:
+        mode_started = time.perf_counter()
+        per_domain = evaluate(domains, all_tasks, mode="hybrid", embedder=embedder,
+                              reranker=reranker)
+        runs["hybrid+rerank"] = (per_domain, time.perf_counter() - mode_started)
     elapsed = time.perf_counter() - started
     if len(runs) == 1:
         mode, (per_domain, _) = next(iter(runs.items()))
         markdown = report(per_domain, mode, elapsed)
     else:
-        markdown = ablation_report(runs, elapsed)
+        markdown = ablation_report(
+            runs, elapsed,
+            rerank_seconds=reranker.seconds if reranker else 0.0,
+            rerank_calls=reranker.calls if reranker else 0)
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(markdown, encoding="utf-8")
