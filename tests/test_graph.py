@@ -144,6 +144,92 @@ def test_empty_turn_at_the_turn_cap_does_not_retry(monkeypatch):
     assert len(client.calls) == 1
 
 
+def test_duplicate_call_appends_one_repeat_nudge(monkeypatch):
+    monkeypatch.setattr(tools, "dispatch", lambda name, args, ctx: "same")
+    client = scripted(call("grep", {"pattern": "x"}, "c1"),
+                      call("grep", {"pattern": "x"}, "c2"),
+                      call("answer", {"value": "1"}, "c3"))
+    state = graph.run("q", client, CTX)
+
+    nudges = [m for m in state["messages"]
+              if m.get("content") == policy.REPEAT_NUDGE]
+    assert len(nudges) == 1
+    assert client.calls[2][-1] == {"role": "user",
+                                   "content": policy.REPEAT_NUDGE}
+    assert state["answer"] == "1"
+
+
+def test_repeated_identical_calls_produce_one_nudge(monkeypatch):
+    monkeypatch.setattr(tools, "dispatch", lambda name, args, ctx: "same")
+    replies = [call("grep", {"pattern": "x"}, f"c{i}") for i in range(4)]
+    replies.append(call("answer", {"value": "1"}, "c5"))
+    state = graph.run("q", scripted(*replies), CTX)
+
+    assert sum(m.get("content") == policy.REPEAT_NUDGE
+               for m in state["messages"]) == 1
+
+
+def test_distinct_calls_do_not_append_the_repeat_nudge(monkeypatch):
+    monkeypatch.setattr(tools, "dispatch", lambda name, args, ctx: "ok")
+    client = scripted(call("grep", {"pattern": "x"}, "c1"),
+                      call("grep", {"pattern": "y"}, "c2"),
+                      call("grep", {"pattern": "x", "path": "b.md"}, "c3"),
+                      call("answer", {"value": "1"}, "c4"))
+    state = graph.run("q", client, CTX)
+
+    assert not any(m.get("content") == policy.REPEAT_NUDGE
+                   for m in state["messages"])
+
+
+def test_repeat_detection_normalizes_argument_order_and_keys(monkeypatch):
+    monkeypatch.setattr(tools, "dispatch", lambda name, args, ctx: "ok")
+    client = scripted(call("grep", {" pattern": "x", "path": "a.md"}, "c1"),
+                      call("grep", {"path": "a.md", "pattern": "x"}, "c2"),
+                      call("answer", {"value": "1"}, "c3"))
+    state = graph.run("q", client, CTX)
+
+    assert sum(m.get("content") == policy.REPEAT_NUDGE
+               for m in state["messages"]) == 1
+
+
+def test_recent_calls_keeps_the_last_twenty(monkeypatch):
+    monkeypatch.setattr(tools, "dispatch", lambda name, args, ctx: "ok")
+    replies = [call("grep", {"pattern": f"q{i}"}, f"c{i}") for i in range(25)]
+    replies.append(call("answer", {"value": "1"}, "c26"))
+    state = graph.run("q", scripted(*replies), CTX)
+
+    assert len(state["recent_calls"]) == 20
+
+
+def test_repeat_nudge_is_not_appended_in_the_final_phase(monkeypatch):
+    monkeypatch.setattr(policy, "MAX_TURNS", 3)
+    monkeypatch.setattr(policy, "FINAL_TURNS", 2)
+    monkeypatch.setattr(tools, "dispatch", lambda name, args, ctx: "ok")
+    client = scripted(call("grep", {"pattern": "x"}, "c1"),
+                      call("grep", {"pattern": "x"}, "c2"),
+                      call("answer", {"value": "1"}, "c3"))
+    state = graph.run("q", client, CTX)
+
+    contents = [m.get("content") for m in state["messages"]]
+    assert policy.REPEAT_NUDGE not in contents
+    assert contents.count(policy.FINAL_NUDGE) == 1
+    assert client.calls[-1][-1] == {"role": "user",
+                                    "content": policy.FINAL_ANSWER_NUDGE}
+
+
+def test_repeated_calls_stay_bounded_by_max_turns(monkeypatch):
+    monkeypatch.setattr(policy, "MAX_TURNS", 3)
+    monkeypatch.setattr(policy, "FINAL_TURNS", 0)
+    monkeypatch.setattr(tools, "dispatch", lambda name, args, ctx: "ok")
+    replies = [call("grep", {"pattern": "x"}, f"c{i}") for i in range(10)]
+    client = scripted(*replies)
+    state = graph.run("q", client, CTX)
+
+    assert state["turns"] == 3
+    assert len(client.calls) == 3
+    assert state["answer"] == "UNKNOWN"
+
+
 def test_final_phase_offers_python_and_answer_and_ends_on_the_submission(monkeypatch):
     monkeypatch.setattr(policy, "MAX_TURNS", 3)
     monkeypatch.setattr(policy, "FINAL_TURNS", 2)

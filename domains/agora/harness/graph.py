@@ -21,11 +21,16 @@ from langgraph.graph import END, StateGraph
 from . import context, policy, prompts, tools
 
 
+_RECENT_CALLS = 20       # exact-repeat detection window
+
+
 class State(TypedDict, total=False):
     messages: list[dict]
     turns: int
     empty_retries: int
     final_nudged: bool
+    recent_calls: list[str]
+    repeat_nudged: str | None
     answer: str
     usage: dict
 
@@ -33,6 +38,41 @@ class State(TypedDict, total=False):
 def _tool_message(call: dict, content: str) -> dict:
     return {"role": "tool", "tool_call_id": call.get("id") or "",
             "content": content}
+
+
+def _call_key(name: str, arguments: str | None) -> str:
+    """Canonical ``name + arguments`` key for exact duplicate detection.
+
+    Argument order and the provider's whitespace-padded keys are normalized so
+    the same call hashes the same way across turns. Invalid JSON is kept as
+    text: the call still failed identically, so it still counts as a repeat.
+    """
+    try:
+        args = json.loads(arguments or "{}")
+    except (TypeError, ValueError):
+        args = str(arguments or "")
+    if isinstance(args, dict):
+        args = {str(key).strip(): value for key, value in args.items()}
+    return json.dumps([name, args], sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False)
+
+
+def _repeated_call_nudge(state: State) -> str | None:
+    """The nudge when the latest call reaches REPEAT_LIMIT occurrences.
+
+    The same key is nudged once. Another repeated call can trigger its own
+    nudge, but a model that ignores the first one does not grow the prompt with
+    an identical message every turn.
+    """
+    recent = state.get("recent_calls") or []
+    if len(recent) < policy.REPEAT_LIMIT:
+        return None
+    key = recent[-1]
+    if recent.count(key) < policy.REPEAT_LIMIT:
+        return None
+    if state.get("repeat_nudged") == key:
+        return None
+    return policy.REPEAT_NUDGE
 
 
 def _empty_reply(message: dict) -> bool:
@@ -89,6 +129,11 @@ def build(client=None, ctx: tools.Context | None = None):
                     messages = messages + [{"role": "user",
                                             "content": policy.FINAL_NUDGE}]
                     update["final_nudged"] = True
+        else:
+            repeat = _repeated_call_nudge(state)
+            if repeat:
+                messages = messages + [{"role": "user", "content": repeat}]
+                update["repeat_nudged"] = state["recent_calls"][-1]
         reply = dict(client(messages, specs))
         update["messages"] = messages + [reply]
         if reply.get("usage"):
@@ -99,8 +144,10 @@ def build(client=None, ctx: tools.Context | None = None):
         call_message = state["messages"][-1]
         results = []
         answer = state.get("answer")
+        recent = list(state.get("recent_calls") or [])
         for call in call_message.get("tool_calls") or []:
             name = call["function"]["name"]
+            recent.append(_call_key(name, call["function"].get("arguments")))
             try:
                 args = json.loads(call["function"].get("arguments") or "{}")
                 if isinstance(args, dict):
@@ -118,7 +165,8 @@ def build(client=None, ctx: tools.Context | None = None):
             except Exception as exc:  # a tool bug is evidence, not a crash
                 output = f"error: {type(exc).__name__}: {exc}"
             results.append(_tool_message(call, str(output)))
-        update: dict = {"messages": state["messages"] + results}
+        update: dict = {"messages": state["messages"] + results,
+                        "recent_calls": recent[-_RECENT_CALLS:]}
         if answer is not None:
             update["answer"] = answer
         return update
@@ -164,7 +212,8 @@ def run(task: str, client, ctx: tools.Context) -> dict:
     state = build(client, ctx).invoke(
         {"messages": [{"role": "system", "content": prompts.SYSTEM},
                       {"role": "user", "content": task}],
-         "turns": 0, "empty_retries": 0},
+         "turns": 0, "empty_retries": 0, "recent_calls": [],
+         "repeat_nudged": None},
         {"recursion_limit": 2 * policy.MAX_TURNS + 5})
     state["answer"] = state.get("answer") or _last_text(state["messages"]) or "UNKNOWN"
     return state

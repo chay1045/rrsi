@@ -35,6 +35,12 @@ EMPTY_TURN_RETRIES = 2   # bounded re-prompts when an assistant turn has no cont
                          # and no tool call, instead of ending the episode
 EMPTY_TURN_NUDGE = ("Your last reply was empty. Call one tool now. "
                     "If you have the final value, call answer.")
+REPEAT_LIMIT = 2         # occurrences of one exact name+arguments key in the last
+                         # 20 calls that trigger the repeat nudge
+REPEAT_NUDGE = ("You repeated the same tool call with the same arguments. Do not "
+                "repeat it; it adds no evidence. Read notes.md and reuse what you "
+                "already have, change the query or path, compute with python, or "
+                "call answer if the value is ready.")
 
 SNIPPET_CHARS = 1200     # ~300 tokens per search hit
 READ_CHARS = 12000       # one read_file slice (two 6k slices)
