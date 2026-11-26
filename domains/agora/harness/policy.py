@@ -10,10 +10,17 @@ RERANK = True            # cross-encoder rescoring of the RRF top-50. Gate 2
                          # +0.066]; region +0.102; MRR +0.109. Costs ~1.0 s per
                          # search, about 30 s per base14 episode. Requires
                          # scripts/serve_rerank.sh; set False for RRF only.
-MAX_TURNS = 400          # model calls per episode. The cloud 100-turn smoke took
-                         # 308 s, so 400 (~21 min) fits the 3600 s task timeout.
+MAX_TURNS = 150          # model calls per episode. The cloud 100-turn smoke took
+                         # 308 s, so 150 (~8 min) fits the 3600 s task timeout.
                          # The local 100-turn H0 is recorded at 42cfea4; local
                          # runs must lower this cap or expect timeouts.
+FINAL_TURNS = 4          # last turns of the episode: the client offers only
+                         # the answer tool, so the episode must commit.
+FINAL_NUDGE = ("You have reached the final turns of this episode. Do not search, "
+               "read or compute again. Call the answer tool now with the final "
+               "value you can support from the evidence already gathered. Submit "
+               "the value only. If you are not certain, submit your best "
+               "supported value; do not guess one.")
 TEMPERATURE = 1.0        # Agora's official setting; cli.py passes these two
 MAX_TOKENS = 8192        # to the endpoint when it wraps the client. 1024 cut the
                          # reasoning short; 4096 was never saturated, 8192 gives

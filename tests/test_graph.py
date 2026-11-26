@@ -30,13 +30,15 @@ def call(name, args, call_id="c1"):
 def scripted(*replies):
     """A client that returns the scripted replies in order."""
     pending = list(replies)
-    calls = []
+    calls, specs_seen = [], []
 
     def client(messages, specs):
         calls.append(messages)
+        specs_seen.append(specs)
         return dict(pending.pop(0))
 
     client.calls = calls
+    client.specs = specs_seen
     return client
 
 
@@ -53,6 +55,7 @@ def test_answer_tool_terminates():
 
 def test_stops_at_max_turns(monkeypatch):
     monkeypatch.setattr(policy, "MAX_TURNS", 3)
+    monkeypatch.setattr(policy, "FINAL_TURNS", 0)
     client = scripted(*[call("nope", {}) for _ in range(10)])
     state = graph.run("never answered", client, CTX)
     assert state["turns"] == 3
@@ -92,6 +95,7 @@ def test_usage_is_summed_but_not_sent_back():
 
 def test_answer_on_the_last_allowed_turn_is_captured(monkeypatch):
     monkeypatch.setattr(policy, "MAX_TURNS", 1)
+    monkeypatch.setattr(policy, "FINAL_TURNS", 0)
     state = graph.run("q", scripted(call("answer", {"value": "42"})), CTX)
     assert state["answer"] == "42"
 
@@ -132,11 +136,54 @@ def test_empty_turns_stop_after_the_retry_bound(monkeypatch):
 
 def test_empty_turn_at_the_turn_cap_does_not_retry(monkeypatch):
     monkeypatch.setattr(policy, "MAX_TURNS", 1)
+    monkeypatch.setattr(policy, "FINAL_TURNS", 0)
     client = scripted({"role": "assistant", "content": None})
     state = graph.run("q", client, CTX)
     assert state["answer"] == "UNKNOWN"
     assert state["turns"] == 1
     assert len(client.calls) == 1
+
+
+def test_final_phase_offers_only_answer_and_ends_on_the_submission(monkeypatch):
+    monkeypatch.setattr(policy, "MAX_TURNS", 3)
+    monkeypatch.setattr(policy, "FINAL_TURNS", 2)
+    client = scripted(call("nope", {}, "c1"), call("answer", {"value": "4"}, "c2"))
+    state = graph.run("q", client, CTX)
+
+    assert [len(specs) for specs in client.specs] == [len(tools.SPECS), 1]
+    assert client.specs[1] == [tools.ANSWER_SPEC]
+    assert client.calls[1][-1] == {"role": "user",
+                                   "content": policy.FINAL_NUDGE}
+    assert state["turns"] == 2
+    assert state["final_nudged"] is True
+    assert state["answer"] == "4"
+    assert len(client.calls) == 2  # no turn after the answer
+
+
+def test_final_phase_appends_the_nudge_once(monkeypatch):
+    monkeypatch.setattr(policy, "MAX_TURNS", 3)
+    monkeypatch.setattr(policy, "FINAL_TURNS", 2)
+    client = scripted(call("nope", {}, "c1"), call("nope", {}, "c2"),
+                      call("nope", {}, "c3"))
+    state = graph.run("q", client, CTX)
+
+    nudges = [m for m in state["messages"]
+              if m.get("content") == policy.FINAL_NUDGE]
+    assert len(nudges) == 1
+    assert all(len(specs) == 1 for specs in client.specs[1:])
+    assert state["turns"] == 3
+    assert state["answer"] == "UNKNOWN"
+
+
+def test_final_phase_content_reply_is_the_text_fallback(monkeypatch):
+    monkeypatch.setattr(policy, "MAX_TURNS", 2)
+    monkeypatch.setattr(policy, "FINAL_TURNS", 2)
+    client = scripted({"role": "assistant", "content": " 42 "})
+    state = graph.run("q", client, CTX)
+
+    assert client.specs[0] == [tools.ANSWER_SPEC]
+    assert state["turns"] == 1
+    assert state["answer"] == "42"
 
 
 def test_trim_drops_oldest_tool_block_and_keeps_system():

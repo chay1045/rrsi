@@ -99,7 +99,7 @@ class _Live:
 
 def _client():
     """OpenAI-compatible chat client for the policy endpoint (vLLM or Ollama)."""
-    from openai import OpenAI
+    from openai import BadRequestError, OpenAI, UnprocessableEntityError
 
     key = os.environ.get("OPENAI_API_KEY") or "dummy"
     endpoint = OpenAI(
@@ -110,9 +110,24 @@ def _client():
     os.environ.pop("RRSI_API_KEY", None)
 
     def call(messages: list[dict], specs: list[dict]) -> dict:
-        reply = endpoint.chat.completions.create(
-            model=MODEL, messages=messages, tools=specs,
-            temperature=policy.TEMPERATURE, max_tokens=policy.MAX_TOKENS)
+        request = {"model": MODEL, "messages": messages, "tools": specs,
+                   "temperature": policy.TEMPERATURE,
+                   "max_tokens": policy.MAX_TOKENS}
+        names = [(spec.get("function") or {}).get("name") for spec in specs]
+        if names == ["answer"]:
+            # The final phase must commit. The graph offers only this tool; the
+            # provider must not leave the model free to keep researching.
+            request["tool_choice"] = {"type": "function",
+                                      "function": {"name": "answer"}}
+        try:
+            reply = endpoint.chat.completions.create(**request)
+        except (BadRequestError, UnprocessableEntityError) as exc:
+            if "tool_choice" not in request:
+                raise
+            print(f"warning: endpoint rejected tool_choice: {exc}; "
+                  "retrying without it", file=sys.stderr)
+            del request["tool_choice"]
+            reply = endpoint.chat.completions.create(**request)
         choice = reply.choices[0].message
         # Only the OpenAI message fields: the reply is sent back on every turn.
         message = {"role": "assistant", "content": choice.content}

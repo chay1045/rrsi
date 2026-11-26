@@ -103,6 +103,7 @@ def test_context_trimming_does_not_shorten_the_trajectory(tmp_path, monkeypatch)
     # budget. The trajectory must still hold the whole episode, or the analyst
     # reading it never sees the loop that burned the tokens.
     monkeypatch.setattr(cli.policy, "MAX_TURNS", 5)
+    monkeypatch.setattr(cli.policy, "FINAL_TURNS", 0)
     monkeypatch.setattr(cli.policy, "CONTEXT_CHARS", 4000)
     monkeypatch.setattr(cli.tools, "dispatch",
                         lambda name, args, ctx: "x" * 3000)
@@ -149,3 +150,76 @@ def test_interrupt_still_writes_a_partial_trajectory(tmp_path):
     assert trajectory["status"] == "error"
     assert trajectory["error"].startswith("KeyboardInterrupt")
     assert not (tmp_path / "answer.txt").exists()
+
+
+def _reply(content="10.37 pp"):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(content=content, tool_calls=None))],
+        usage=SimpleNamespace(model_dump=lambda: {"total_tokens": 1}))
+
+
+def _fake_endpoint(monkeypatch, completions):
+    """Replace the SDK endpoint; ``_client`` imports it at call time."""
+    from types import SimpleNamespace
+
+    import openai
+
+    class Endpoint:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=completions)
+
+    monkeypatch.setattr(openai, "OpenAI", Endpoint)
+    return openai
+
+
+def test_client_forces_answer_only_in_the_final_phase(monkeypatch):
+    requests = []
+
+    class Completions:
+        def create(self, **kwargs):
+            requests.append(kwargs)
+            return _reply()
+
+    _fake_endpoint(monkeypatch, Completions())
+    monkeypatch.setenv("OPENAI_API_KEY", "dummy")
+    monkeypatch.setenv("RRSI_API_KEY", "dummy")
+    client = cli._client()
+
+    client([{"role": "user", "content": "q"}], [cli.tools.ANSWER_SPEC])
+    client([{"role": "user", "content": "q"}], cli.tools.SPECS)
+
+    assert requests[0]["tool_choice"] == {
+        "type": "function", "function": {"name": "answer"}}
+    assert "tool_choice" not in requests[1]
+
+
+def test_client_reports_a_rejected_tool_choice_and_retries_once(monkeypatch, capsys):
+    class Rejected(Exception):
+        pass
+
+    requests = []
+
+    class Completions:
+        def create(self, **kwargs):
+            requests.append(kwargs)
+            if "tool_choice" in kwargs:
+                raise Rejected("tool_choice is not supported")
+            return _reply()
+
+    openai = _fake_endpoint(monkeypatch, Completions())
+    monkeypatch.setattr(openai, "BadRequestError", Rejected)
+    monkeypatch.setattr(openai, "UnprocessableEntityError", Rejected)
+    monkeypatch.setenv("OPENAI_API_KEY", "dummy")
+    monkeypatch.setenv("RRSI_API_KEY", "dummy")
+
+    reply = cli._client()([{"role": "user", "content": "q"}],
+                          [cli.tools.ANSWER_SPEC])
+
+    assert reply["content"] == "10.37 pp"
+    assert len(requests) == 2
+    assert "tool_choice" in requests[0]
+    assert "tool_choice" not in requests[1]
+    assert "rejected tool_choice" in capsys.readouterr().err

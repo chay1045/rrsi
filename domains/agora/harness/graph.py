@@ -5,6 +5,9 @@ message is an OpenAI-style assistant dict (``content`` and ``tool_calls``), with
 an optional ``usage`` key that is summed into the trajectory and never sent
 back to the model. Tests pass a scripted callable; cli.py passes one that wraps
 the OpenAI client.
+
+The last ``policy.FINAL_TURNS`` calls form a bounded final phase: one nudge is
+appended and the client receives only the answer tool.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ class State(TypedDict, total=False):
     messages: list[dict]
     turns: int
     empty_retries: int
+    final_nudged: bool
     answer: str
     usage: dict
 
@@ -51,6 +55,12 @@ def _add_usage(usage: dict, reply: dict) -> dict:
     return used
 
 
+def _final_phase(state: State) -> bool:
+    """The bounded last turns: the client may only submit an answer."""
+    return (policy.FINAL_TURNS > 0
+            and state["turns"] >= policy.MAX_TURNS - policy.FINAL_TURNS)
+
+
 def build(client=None, ctx: tools.Context | None = None):
     """Compile the graph. ``client`` is only needed when it is invoked.
 
@@ -62,9 +72,16 @@ def build(client=None, ctx: tools.Context | None = None):
         if client is None:
             raise RuntimeError("graph.build() needs client=<callable> to run")
         messages = context.trim(state["messages"])
-        reply = dict(client(messages, tools.SPECS))
-        update: dict = {"messages": messages + [reply],
-                        "turns": state["turns"] + 1}
+        specs = tools.SPECS
+        update: dict = {"turns": state["turns"] + 1}
+        if _final_phase(state):
+            specs = [tools.ANSWER_SPEC]
+            if not state.get("final_nudged"):
+                messages = messages + [{"role": "user",
+                                        "content": policy.FINAL_NUDGE}]
+                update["final_nudged"] = True
+        reply = dict(client(messages, specs))
+        update["messages"] = messages + [reply]
         if reply.get("usage"):
             update["usage"] = _add_usage(state.get("usage"), reply)
         return update

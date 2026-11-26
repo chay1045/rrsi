@@ -152,6 +152,14 @@ def _spec(name: str, description: str, properties: dict, required: list[str]) ->
                        "required": required}}}
 
 
+ANSWER_SPEC = _spec(
+    "answer",
+    "Finish the episode with the final value. Call once, last. Format: submit "
+    "the value only, with no label, explanation or surrounding text. Keep a "
+    "unit, sign, separator or rounding only when the value itself needs it.",
+    {"value": {"type": "string", "description": "the answer only"}},
+    ["value"])
+
 SPECS = [
     _spec("search_docs",
           "Hybrid keyword and semantic search over the domain's documents. "
@@ -177,8 +185,5 @@ SPECS = [
           "AGORA_DATA path.",
           {"code": {"type": "string"}},
           ["code"]),
-    _spec("answer",
-          "Finish the episode with the final value. Call once, last.",
-          {"value": {"type": "string", "description": "the answer only"}},
-          ["value"]),
+    ANSWER_SPEC,
 ]
