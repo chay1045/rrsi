@@ -109,6 +109,21 @@ def _slug(domain: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", domain.lower()).strip("-")
 
 
+def _max_concurrent() -> int:
+    """Episode concurrency: a cloud policy can exceed the local 4."""
+    raw = os.environ.get("AGORA_MAX_CONCURRENT")
+    if raw is None:
+        return int(CFG["max_concurrent"])
+    try:
+        return max(1, int(raw))
+    except ValueError as exc:
+        raise ValueError(
+            f"AGORA_MAX_CONCURRENT must be an integer, got {raw!r}") from exc
+
+
+MAX_CONCURRENT = _max_concurrent()
+
+
 def _name(task_id: str) -> str:
     # The task id is "<domain>/<qid>"; one safe directory per task.
     return task_id.replace("/", "__")
@@ -280,6 +295,7 @@ class AgoraDomain(Domain):
         violations = _scan_harness(root)
         (job_dir / "guard.json").write_text(json.dumps(
             {"image": image, "image_id": image_id,
+             "max_concurrent": MAX_CONCURRENT,
              "violations": violations}, indent=1), encoding="utf-8")
         if violations:
             _log(log_path, f"{log_prefix}{job}: harness guard violations: "
@@ -319,7 +335,7 @@ class AgoraDomain(Domain):
             _log(log_path, f"{log_prefix}{job}: all {len(ids) * k} trials exist")
             return
 
-        workers = max(1, min(int(CFG["max_concurrent"]), len(episodes)))
+        workers = max(1, min(MAX_CONCURRENT, len(episodes)))
         _log(log_path, f"{log_prefix}{job}: {len(episodes)} episodes, "
                        f"image {image}, concurrency {workers}")
         with ThreadPoolExecutor(max_workers=workers) as pool:
