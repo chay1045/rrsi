@@ -52,7 +52,8 @@ def search_docs(query: str, k: int | None = None, ctx: Context = None) -> str:
     db = Path(ctx.index_dir) / f"{_slug(ctx.domain)}.sqlite"
     if not db.is_file():
         raise FileNotFoundError(f"no index for {ctx.domain!r} at {db}; run index/build.py")
-    k = min(max(int(k or policy.K), 1), policy.K)
+    requested = policy.K if k is None else int(k)
+    k = min(max(requested, 1), policy.MAX_K)
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
         reranker = index_search.default_reranker() if policy.RERANK else None
@@ -252,7 +253,9 @@ SPECS = [
           "Hybrid keyword and semantic search over the domain's documents. "
           "Returns path, line range and a short snippet per hit.",
           {"query": {"type": "string", "description": "what to find, in the question's terms"},
-           "k": {"type": "integer", "description": f"hits (default {policy.K})"}},
+           "k": {"type": "integer", "minimum": 1, "maximum": policy.MAX_K,
+                 "description": (f"hits to return (default {policy.K}, "
+                                 f"max {policy.MAX_K})")}},
           ["query"]),
     _spec("read_file",
           "Read a line range of a text document from the archive. Paths come "

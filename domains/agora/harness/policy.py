@@ -4,7 +4,11 @@ Char budgets, not token budgets: the tool layer never sees the policy
 tokenizer, and 4 chars/token keeps the estimate one line.
 """
 
-K = 5                    # search_docs hits per call
+K = 5                    # search_docs default hits per call. Ten hits double
+                         # the tool result, so the default stays at 5; a caller
+                         # that needs breadth asks for up to MAX_K.
+MAX_K = 10               # search_docs hard cap, equal to Gate 2's top-10 and
+                         # the reranker output. The tool spec advertises it.
 RERANK = True            # cross-encoder rescoring of the RRF top-50. Gate 2
                          # (issue #15): file recall +0.036, 95% CI [+0.006,
                          # +0.066]; region +0.102; MRR +0.109. Costs ~1.0 s per
