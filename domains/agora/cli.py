@@ -26,18 +26,88 @@ import time
 from pathlib import Path
 
 import tasks
-from harness import graph, policy, tools
+from harness import graph, policy, prompts, tools
 
 MODEL = os.environ.get("AGORA_MODEL", "Inkling-2-Mini")
+LIVE = os.environ.get("AGORA_LIVE") == "1"
+
+
+def _clip(value, limit: int = 800) -> str:
+    text = "" if value is None else str(value)
+    return text if len(text) <= limit else text[:limit] + f" ...[+{len(text) - limit} chars]"
+
+
+class _Live:
+    """Opt-in trace: full JSONL plus a compact text view in the output dir."""
+
+    def __init__(self, out: Path):
+        out.mkdir(parents=True, exist_ok=True)
+        self.text_path = out / "live.log"
+        self.json_path = out / "live.jsonl"
+
+    def event(self, kind: str, **fields) -> None:
+        stamp = time.strftime("%H:%M:%S")
+        with open(self.json_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"time": stamp, "event": kind, **fields},
+                                    ensure_ascii=False) + "\n")
+        line = self._line(kind, fields)
+        with open(self.text_path, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+        print(line, flush=True)
+
+    @staticmethod
+    def _line(kind: str, f: dict) -> str:
+        if kind == "run_start":
+            return (f"[live] RUN task={f['task']} model={f['model']} "
+                    f"trial={f['trial']} max_turns={f['max_turns']} "
+                    f"max_tokens={f['max_tokens']}\n"
+                    f"[live] QUESTION: {f['query']}\n"
+                    f"[live] SYSTEM: {f['system']}")
+        if kind == "model_request":
+            tail = f["messages"][-1] if f["messages"] else {}
+            return (f"[live] MODEL turn={f['turn']} messages={len(f['messages'])} "
+                    f"last={tail.get('role')}:{_clip(tail.get('content'), 300)} "
+                    f"tools={f['tools']}")
+        if kind == "model_reply":
+            calls = "; ".join(
+                f"{c.get('function', {}).get('name')}"
+                f"({_clip(c.get('function', {}).get('arguments'), 240)})"
+                for c in (f.get("tool_calls") or []))
+            return (f"[live] REPLY turn={f['turn']} elapsed={f['elapsed_s']}s "
+                    f"content={_clip(f.get('content'), 400)} calls=[{calls}] "
+                    f"usage={f.get('usage')}")
+        if kind == "model_error":
+            return f"[live] MODEL ERROR turn={f['turn']} {f['error']}"
+        if kind == "tool_call":
+            return (f"[live] TOOL {f['name']} "
+                    f"args={_clip(json.dumps(f.get('args'), ensure_ascii=False), 900)}")
+        if kind == "tool_result":
+            return (f"[live] RESULT {f['name']} chars={len(str(f.get('result')))} "
+                    f"preview={_clip(f.get('result'), 700)}")
+        if kind == "tool_error":
+            return f"[live] TOOL ERROR {f['name']} {f['error']}"
+        if kind == "run_error":
+            return f"[live] RUN ERROR {f['error']}"
+        if kind == "final":
+            return (f"[live] FINAL status={f['status']} turns={f['turns']} "
+                    f"tokens={(f.get('usage') or {}).get('total_tokens')} "
+                    f"answer={_clip(f.get('answer'), 1200)} error={f.get('error')}")
+        if kind == "skipped":
+            return f"[live] SKIP task={f['task']} trial={f['trial']}"
+        return f"[live] {kind} {json.dumps(f, ensure_ascii=False)[:500]}"
 
 
 def _client():
     """OpenAI-compatible chat client for the policy endpoint (vLLM or Ollama)."""
     from openai import OpenAI
 
+    key = os.environ.get("OPENAI_API_KEY") or "dummy"
     endpoint = OpenAI(
         base_url=os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1"),
-        api_key=os.environ.get("OPENAI_API_KEY") or "dummy")
+        api_key=key)
+    # Keep the policy key out of the environment inherited by the python tool.
+    os.environ.pop("OPENAI_API_KEY", None)
+    os.environ.pop("RRSI_API_KEY", None)
 
     def call(messages: list[dict], specs: list[dict]) -> dict:
         reply = endpoint.chat.completions.create(
@@ -101,27 +171,67 @@ def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
              ctx: tools.Context | None = None) -> dict:
     """One episode; always leaves ``trajectory.json`` (unless skipped)."""
     out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    live = _Live(out) if LIVE else None
+
+    def log(kind: str, **fields) -> None:
+        if live is not None:
+            live.event(kind, **fields)
+
     answer_path = out / "answer.txt"
     if answer_path.exists():
+        log("skipped", task=task.id, trial=trial)
         return {"task": task.id, "trial": trial, "status": "skipped",
                 "turns": 0, "usage": {"total_tokens": 0}}
 
     usage: dict = {}
     history: list[dict] = []  # the whole episode, unlike the trimmed state
     seen: set = set()
+    log("run_start", task=task.id, query=task.query, system=prompts.SYSTEM,
+        model=MODEL, trial=trial, max_turns=policy.MAX_TURNS,
+        max_tokens=policy.MAX_TOKENS)
+
+    turn = 0
 
     def model(messages: list[dict], specs: list[dict]) -> dict:
+        nonlocal turn
+        turn += 1
+        log("model_request", turn=turn, messages=messages,
+            tools=[(spec.get("function") or {}).get("name") for spec in specs])
         if not history:
             history.extend(messages)  # system + task, once
         # A tool result reaches the model on the next call, trimmed later.
         _add_tool_results(history, seen, messages)
-        reply = dict(client(messages, specs))
+        request_started = time.monotonic()
+        try:
+            reply = dict(client(messages, specs))
+        except BaseException as exc:
+            log("model_error", turn=turn,
+                error=f"{type(exc).__name__}: {exc}")
+            raise
+        log("model_reply", turn=turn,
+            elapsed_s=round(time.monotonic() - request_started, 3),
+            content=reply.get("content"), tool_calls=reply.get("tool_calls"),
+            usage=reply.get("usage"))
         for key, value in (reply.pop("usage", None) or {}).items():
             if isinstance(value, (int, float)):
                 usage[key] = usage.get(key, 0) + value
         history.append(reply)
         return reply
 
+    original_dispatch = tools.dispatch
+
+    def dispatch(name, args, ctx):
+        log("tool_call", name=name, args=args)
+        try:
+            result = original_dispatch(name, args, ctx)
+        except BaseException as exc:
+            log("tool_error", name=name, error=f"{type(exc).__name__}: {exc}")
+            raise
+        log("tool_result", name=name, result=str(result))
+        return result
+
+    tools.dispatch = dispatch
     started = time.monotonic()
     interrupted = None
     try:
@@ -134,11 +244,16 @@ def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
         status, error = "error", f"{type(exc).__name__}: {exc}"
         answer = "UNKNOWN"
         turns = sum(1 for m in history if m.get("role") == "assistant")
+        log("run_error", error=error)
         if not isinstance(exc, Exception):
             interrupted = exc
+    finally:
+        tools.dispatch = original_dispatch
     wall_time = round(time.monotonic() - started, 3)
 
     usage.setdefault("total_tokens", 0)
+    log("final", status=status, turns=turns, answer=answer, usage=usage,
+        error=error)
     trajectory = {
         "task": task.id,
         "domain": task.domain,
@@ -152,7 +267,6 @@ def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
         "tool_calls": _tool_calls(history),
         "messages": history,
     }
-    out.mkdir(parents=True, exist_ok=True)
     _write(out / "trajectory.json", json.dumps(trajectory, ensure_ascii=False))
     if status == "ok":
         _write(answer_path, answer + "\n")
