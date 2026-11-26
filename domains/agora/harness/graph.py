@@ -77,15 +77,18 @@ def build(client=None, ctx: tools.Context | None = None):
         update: dict = {"turns": state["turns"] + 1}
         if _final_phase(state):
             if state["turns"] >= policy.MAX_TURNS - 1:
-                # The last allowed call: commit.
+                # The last allowed call: commit. Revoke python explicitly; the
+                # earlier nudge still permits it and the model may follow that.
                 specs = [tools.ANSWER_SPEC]
+                messages = messages + [{"role": "user",
+                                        "content": policy.FINAL_ANSWER_NUDGE}]
             else:
                 # Earlier final calls: allow python, but only answer or python.
                 specs = tools.FINAL_SPECS
-            if not state.get("final_nudged"):
-                messages = messages + [{"role": "user",
-                                        "content": policy.FINAL_NUDGE}]
-                update["final_nudged"] = True
+                if not state.get("final_nudged"):
+                    messages = messages + [{"role": "user",
+                                            "content": policy.FINAL_NUDGE}]
+                    update["final_nudged"] = True
         reply = dict(client(messages, specs))
         update["messages"] = messages + [reply]
         if reply.get("usage"):

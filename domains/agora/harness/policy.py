@@ -23,6 +23,10 @@ FINAL_NUDGE = ("You have reached the final turns of this episode. Do not search 
                "the last final turn accepts only answer. Submit the value only. "
                "If you are not certain, submit your best supported value; do not "
                "guess one.")
+FINAL_ANSWER_NUDGE = ("This is the last final turn. The python tool is no longer "
+                      "available. Call the answer tool now with the final value "
+                      "only. If you are not certain, submit your best supported "
+                      "value; do not guess one.")
 TEMPERATURE = 1.0        # Agora's official setting; cli.py passes these two
 MAX_TOKENS = 8192        # to the endpoint when it wraps the client. 1024 cut the
                          # reasoning short; 4096 was never saturated, 8192 gives

@@ -171,6 +171,8 @@ def test_final_phase_allows_python_on_the_first_final_turn_then_forces_answer(mo
 
     assert client.specs[1] == tools.FINAL_SPECS
     assert client.specs[2] == [tools.ANSWER_SPEC]
+    assert client.calls[2][-1] == {"role": "user",
+                                   "content": policy.FINAL_ANSWER_NUDGE}
     results = [m for m in state["messages"] if m.get("role") == "tool"]
     assert results[-2]["content"] == "computed 4"
     assert state["turns"] == 3
@@ -205,6 +207,8 @@ def test_final_phase_appends_the_nudge_once(monkeypatch):
     assert len(nudges) == 1
     assert client.specs[1] == tools.FINAL_SPECS
     assert client.specs[2] == [tools.ANSWER_SPEC]
+    assert client.calls[2][-1] == {"role": "user",
+                                   "content": policy.FINAL_ANSWER_NUDGE}
     assert state["turns"] == 3
     assert state["answer"] == "UNKNOWN"
 
@@ -216,6 +220,20 @@ def test_final_phase_content_reply_is_the_text_fallback(monkeypatch):
     state = graph.run("q", client, CTX)
 
     assert client.specs[0] == tools.FINAL_SPECS
+    assert state["turns"] == 1
+    assert state["answer"] == "42"
+
+
+def test_final_answer_nudge_revokes_python_and_keeps_the_text_fallback(monkeypatch):
+    monkeypatch.setattr(policy, "MAX_TURNS", 1)
+    monkeypatch.setattr(policy, "FINAL_TURNS", 1)
+    client = scripted({"role": "assistant", "content": " 42 "})
+    state = graph.run("q", client, CTX)
+
+    assert client.specs[0] == [tools.ANSWER_SPEC]
+    assert client.calls[0][-1] == {"role": "user",
+                                   "content": policy.FINAL_ANSWER_NUDGE}
+    assert "python tool is no longer available" in policy.FINAL_ANSWER_NUDGE
     assert state["turns"] == 1
     assert state["answer"] == "42"
 
