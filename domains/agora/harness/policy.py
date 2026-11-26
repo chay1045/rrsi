@@ -5,9 +5,10 @@ tokenizer, and 4 chars/token keeps the estimate one line.
 """
 
 K = 5                    # search_docs hits per call
-MAX_TURNS = 100          # model calls per episode. 60 was the first baseline
-                         # cap; its slowest episode took 1837 s, so 100 stays
-                         # under the 3600 s task timeout and gives the policy room.
+MAX_TURNS = 400          # model calls per episode. The cloud 100-turn smoke took
+                         # 308 s, so 400 (~21 min) fits the 3600 s task timeout.
+                         # The local 100-turn H0 is recorded at 42cfea4; local
+                         # runs must lower this cap or expect timeouts.
 TEMPERATURE = 1.0        # Agora's official setting; cli.py passes these two
 MAX_TOKENS = 8192        # to the endpoint when it wraps the client. 1024 cut the
                          # reasoning short; 4096 was never saturated, 8192 gives
