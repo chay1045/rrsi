@@ -124,6 +124,21 @@ def _max_concurrent() -> int:
 MAX_CONCURRENT = _max_concurrent()
 
 
+def _task_timeout() -> int:
+    """Per-episode cap: a local 400-turn run needs more than the 3600 s default."""
+    raw = os.environ.get("AGORA_TASK_TIMEOUT_S")
+    if raw is None:
+        return int(CFG["task_timeout_s"])
+    try:
+        return max(1, int(raw))
+    except ValueError as exc:
+        raise ValueError(
+            f"AGORA_TASK_TIMEOUT_S must be an integer, got {raw!r}") from exc
+
+
+TASK_TIMEOUT_S = _task_timeout()
+
+
 def _name(task_id: str) -> str:
     # The task id is "<domain>/<qid>"; one safe directory per task.
     return task_id.replace("/", "__")
@@ -296,6 +311,7 @@ class AgoraDomain(Domain):
         (job_dir / "guard.json").write_text(json.dumps(
             {"image": image, "image_id": image_id,
              "max_concurrent": MAX_CONCURRENT,
+             "task_timeout_s": TASK_TIMEOUT_S,
              "violations": violations}, indent=1), encoding="utf-8")
         if violations:
             _log(log_path, f"{log_prefix}{job}: harness guard violations: "
@@ -399,7 +415,7 @@ class AgoraDomain(Domain):
             process = subprocess.Popen(command, stdout=handle,
                                        stderr=subprocess.STDOUT)
             try:
-                code = process.wait(timeout=int(CFG["task_timeout_s"]))
+                code = process.wait(timeout=TASK_TIMEOUT_S)
             except subprocess.TimeoutExpired:
                 subprocess.run(["docker", "rm", "-f", name],
                                stdout=subprocess.DEVNULL,
