@@ -199,6 +199,9 @@ def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
         log("skipped", task=task.id, trial=trial)
         return {"task": task.id, "trial": trial, "status": "skipped",
                 "turns": 0, "usage": {"total_tokens": 0}}
+    scratch = out / "scratch"
+    scratch.mkdir(parents=True, exist_ok=True)
+    previous_scratch = os.environ.get("AGORA_SCRATCH")
 
     usage: dict = {}
     history: list[dict] = []  # the whole episode, unlike the trimmed state
@@ -248,6 +251,10 @@ def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
         return result
 
     tools.dispatch = dispatch
+    # One scratch directory per episode. The python tool reads it on every call,
+    # so notes.md survives; restoring the old value keeps a reused process from
+    # leaking one episode's scratch into the next.
+    os.environ["AGORA_SCRATCH"] = str(scratch.resolve())
     started = time.monotonic()
     interrupted = None
     try:
@@ -265,6 +272,10 @@ def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
             interrupted = exc
     finally:
         tools.dispatch = original_dispatch
+        if previous_scratch is None:
+            os.environ.pop("AGORA_SCRATCH", None)
+        else:
+            os.environ["AGORA_SCRATCH"] = previous_scratch
     wall_time = round(time.monotonic() - started, 3)
 
     usage.setdefault("total_tokens", 0)

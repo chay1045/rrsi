@@ -118,17 +118,49 @@ def grep(pattern: str, glob: str = "*", ctx: Context = None) -> str:
     return "\n".join(shown)
 
 
+def _link_documents(root: Path, ctx: Context) -> None:
+    # The episode scratch directory outlives one call, so the archive link is
+    # created once and repaired only when it is missing or points elsewhere.
+    link = root / "documents"
+    target = Path(ctx.data_dir).resolve() / "documents"
+    if link.is_symlink():
+        try:
+            if link.resolve() == target:
+                return
+        except (OSError, RuntimeError):
+            pass
+        link.unlink()
+    elif link.exists():
+        return
+    link.symlink_to(target)
+
+
 def python(code: str, ctx: Context = None) -> str:
     # shortcut: no sandbox here, so code runs with a writable host filesystem;
     # the Phase 3 docker shim owns real isolation. The scratch archive view at
-    # least keeps documents/ the only visible path and the cwd disposable.
-    with tempfile.TemporaryDirectory(prefix="agora-py-") as scratch:
-        target = Path(ctx.data_dir).resolve() / "documents"
-        (Path(scratch) / "documents").symlink_to(target)
+    # least keeps documents/ the only visible path. cli.py pins AGORA_SCRATCH
+    # for the episode so extracted data and notes.md survive between calls;
+    # host tests without it keep the disposable fallback.
+    keep = os.environ.get("AGORA_SCRATCH")
+    disposable = None
+    if keep:
+        root = Path(keep).expanduser()
+        root.mkdir(parents=True, exist_ok=True)
+        root = root.resolve()
+    else:
+        disposable = tempfile.TemporaryDirectory(prefix="agora-py-")
+        root = Path(disposable.name)
+    # The child gets the stable archive path, not the private scratch switch.
+    env = {**os.environ, "AGORA_DATA": str(root)}
+    env.pop("AGORA_SCRATCH", None)
+    try:
+        _link_documents(root, ctx)
         done = subprocess.run([sys.executable, "-c", code],
                               capture_output=True, text=True, errors="replace",
-                              cwd=scratch, timeout=policy.PY_TIMEOUT,
-                              env={**os.environ, "AGORA_DATA": scratch})
+                              cwd=root, timeout=policy.PY_TIMEOUT, env=env)
+    finally:
+        if disposable is not None:
+            disposable.cleanup()
     output = done.stdout or ""
     if done.stderr:
         output += ("\n[stderr]\n" if output else "") + done.stderr
@@ -163,7 +195,8 @@ ANSWER_SPEC = _spec(
 PYTHON_SPEC = _spec(
     "python",
     "Run python (pandas, numpy, scipy available) and return stdout. "
-    "The process cwd is a scratch directory; the archive is at the "
+    "The process cwd is a scratch directory that lasts for the episode, so "
+    "notes.md and other files survive between calls. The archive is at the "
     "AGORA_DATA path.",
     {"code": {"type": "string"}},
     ["code"])

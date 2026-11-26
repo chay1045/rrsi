@@ -7,6 +7,7 @@ message``. Token usage is per reply and must add up to the endpoint's report.
 """
 
 import json
+import os
 
 import pytest
 import sys
@@ -104,7 +105,10 @@ def test_context_trimming_does_not_shorten_the_trajectory(tmp_path, monkeypatch)
     # reading it never sees the loop that burned the tokens.
     monkeypatch.setattr(cli.policy, "MAX_TURNS", 5)
     monkeypatch.setattr(cli.policy, "FINAL_TURNS", 0)
-    monkeypatch.setattr(cli.policy, "CONTEXT_CHARS", 4000)
+    # The budget must stay above the system prompt plus one tool block, so the
+    # test measures trimming rather than an undersized prompt. Four 3000-char
+    # results still exceed it and force old blocks out.
+    monkeypatch.setattr(cli.policy, "CONTEXT_CHARS", 8000)
     monkeypatch.setattr(cli.tools, "dispatch",
                         lambda name, args, ctx: "x" * 3000)
 
@@ -119,6 +123,29 @@ def test_context_trimming_does_not_shorten_the_trajectory(tmp_path, monkeypatch)
     assert [len(c["output"]) for c in trajectory["tool_calls"]] == [3000] * 4 + [16]
     assert [m["role"] for m in trajectory["messages"]].count("tool") == 5
     assert (tmp_path / "answer.txt").read_text() == "10.37 pp\n"
+
+
+def test_python_scratch_is_per_episode(tmp_path, monkeypatch):
+    monkeypatch.delenv("AGORA_SCRATCH", raising=False)
+    data = tmp_path / "data"
+    (data / "documents" / TASK.domain).mkdir(parents=True)
+    ctx = cli.tools.Context(domain=TASK.domain, data_dir=data, index_dir=AGORA)
+
+    first = scripted(
+        call("python", {"code": "open('notes.md', 'w').write('first episode')"}, "c1"),
+        call("answer", {"value": "10.37 pp"}, "c2"))
+    cli.run_task(TASK, tmp_path / "one", client=first, ctx=ctx)
+    assert (tmp_path / "one" / "scratch" / "notes.md").read_text() == "first episode"
+    assert "AGORA_SCRATCH" not in os.environ
+
+    second = scripted(
+        call("python", {"code": "open('notes.md').read()"}, "c3"),
+        call("answer", {"value": "10.37 pp"}, "c4"))
+    trajectory = cli.run_task(TASK, tmp_path / "two", client=second, ctx=ctx)
+
+    assert "FileNotFoundError" in trajectory["tool_calls"][0]["output"]
+    assert not (tmp_path / "two" / "scratch" / "notes.md").exists()
+    assert "AGORA_SCRATCH" not in os.environ
 
 
 def test_main_resolves_the_task_id(tmp_path, monkeypatch):

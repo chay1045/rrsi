@@ -269,11 +269,48 @@ def test_read_file_stays_inside_the_domain_docs(tmp_path):
         tools.read_file("../../etc/passwd", 1, 2, ctx=ctx)
 
 
-def test_python_sees_documents_only(tmp_path):
+def test_python_sees_documents_only(tmp_path, monkeypatch):
+    monkeypatch.delenv("AGORA_SCRATCH", raising=False)
     (tmp_path / "documents" / "D").mkdir(parents=True)
     ctx = tools.Context("D", data_dir=tmp_path)
     out = tools.python("import os; print(os.listdir(os.environ['AGORA_DATA']))", ctx=ctx)
     assert "documents" in out and "tasks" not in out
+
+
+def test_python_calls_share_one_scratchpad(tmp_path, monkeypatch):
+    (tmp_path / "documents" / "D").mkdir(parents=True)
+    scratch = tmp_path / "scratch"
+    monkeypatch.setenv("AGORA_SCRATCH", str(scratch))
+    ctx = tools.Context("D", data_dir=tmp_path)
+
+    first = tools.python(
+        "import os; from pathlib import Path; "
+        "Path('notes.md').write_text('q -> 12 pp\\n'); "
+        "print(os.getcwd()); print(Path('documents/D').is_dir())", ctx=ctx)
+    second = tools.python(
+        "import os; from pathlib import Path; "
+        "print(Path('notes.md').read_text(), end=''); "
+        "print(Path('documents').is_symlink()); "
+        "print('AGORA_SCRATCH' in os.environ)", ctx=ctx)
+
+    assert Path(first.splitlines()[0]) == scratch.resolve()
+    assert first.splitlines()[1] == "True"
+    assert second == "q -> 12 pp\nTrue\nFalse\n"
+
+
+def test_python_repairs_a_stale_documents_link(tmp_path, monkeypatch):
+    (tmp_path / "documents" / "D").mkdir(parents=True)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    (scratch / "documents").symlink_to(tmp_path / "gone")
+    monkeypatch.setenv("AGORA_SCRATCH", str(scratch))
+    ctx = tools.Context("D", data_dir=tmp_path)
+
+    out = tools.python("from pathlib import Path; print(Path('documents/D').is_dir())",
+                       ctx=ctx)
+
+    assert out.strip() == "True"
+    assert (scratch / "documents").resolve() == (tmp_path / "documents").resolve()
 
 
 FORBIDDEN = ("reference_files", "agora_tasks", "task_id", "gold")
