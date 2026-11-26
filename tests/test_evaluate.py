@@ -121,6 +121,7 @@ def test_ablation_report_records_rerank_delta_and_ci():
     assert "Rerank delta: recall_file@10 +0.250" in markdown
     assert "95% CI" in markdown
     assert "Score latency: 0.5s over 4 calls (125.0 ms/task)" in markdown
+    assert "Rerank clears both file and region recall at the gate" in markdown
 
 
 def test_rerank_requires_the_hybrid_mode(capsys):

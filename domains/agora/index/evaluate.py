@@ -339,6 +339,10 @@ def ablation_report(runs: dict[str, tuple[dict[str, list[tuple[int | None, int |
             f"recall_region@10 {rerank[1] - hybrid[1]:+.3f}; "
             f"MRR@10 {rerank[2] - hybrid[2]:+.3f}. Score latency: {latency}.",
         ]
+        if rerank[0] >= GATE and rerank[1] >= GATE:
+            lines.append("Rerank clears both file and region recall at the gate.")
+        elif rerank[0] >= GATE:
+            lines.append("Rerank clears file recall but not region recall at the gate.")
     lines.append("")
     lines.append(
         "Caveat: gold pages are mapped to lines through `<!-- pages a-b -->` markers; "

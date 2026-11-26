@@ -5,11 +5,11 @@ tokenizer, and 4 chars/token keeps the estimate one line.
 """
 
 K = 5                    # search_docs hits per call
-RERANK = False           # cross-encoder rescoring of the RRF top-50. Measured
-                         # on Gate 2 (issue #15): file recall -0.039, 95% CI
-                         # [-0.075, -0.003], and +0.98 s/search. Keep it off;
-                         # see docs/retrieval.md. The service is
-                         # scripts/serve_rerank.sh.
+RERANK = True            # cross-encoder rescoring of the RRF top-50. Gate 2
+                         # (issue #15): file recall +0.036, 95% CI [+0.006,
+                         # +0.066]; region +0.102; MRR +0.109. Costs ~1.0 s per
+                         # search, about 30 s per base14 episode. Requires
+                         # scripts/serve_rerank.sh; set False for RRF only.
 MAX_TURNS = 400          # model calls per episode. The cloud 100-turn smoke took
                          # 308 s, so 400 (~21 min) fits the 3600 s task timeout.
                          # The local 100-turn H0 is recorded at 42cfea4; local
