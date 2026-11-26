@@ -160,6 +160,18 @@ ANSWER_SPEC = _spec(
     {"value": {"type": "string", "description": "the answer only"}},
     ["value"])
 
+PYTHON_SPEC = _spec(
+    "python",
+    "Run python (pandas, numpy, scipy available) and return stdout. "
+    "The process cwd is a scratch directory; the archive is at the "
+    "AGORA_DATA path.",
+    {"code": {"type": "string"}},
+    ["code"])
+
+# Final calls before the last: python may compute the value, or answer ends the
+# episode early. The last call offers only answer.
+FINAL_SPECS = [PYTHON_SPEC, ANSWER_SPEC]
+
 SPECS = [
     _spec("search_docs",
           "Hybrid keyword and semantic search over the domain's documents. "
@@ -179,11 +191,6 @@ SPECS = [
           {"pattern": {"type": "string", "description": "regular expression"},
            "glob": {"type": "string", "description": "e.g. '*.md' (default all)"}},
           ["pattern"]),
-    _spec("python",
-          "Run python (pandas, numpy, scipy available) and return stdout. "
-          "The process cwd is a scratch directory; the archive is at the "
-          "AGORA_DATA path.",
-          {"code": {"type": "string"}},
-          ["code"]),
+    PYTHON_SPEC,
     ANSWER_SPEC,
 ]

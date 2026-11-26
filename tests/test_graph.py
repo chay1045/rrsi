@@ -144,20 +144,53 @@ def test_empty_turn_at_the_turn_cap_does_not_retry(monkeypatch):
     assert len(client.calls) == 1
 
 
-def test_final_phase_offers_only_answer_and_ends_on_the_submission(monkeypatch):
+def test_final_phase_offers_python_and_answer_and_ends_on_the_submission(monkeypatch):
     monkeypatch.setattr(policy, "MAX_TURNS", 3)
     monkeypatch.setattr(policy, "FINAL_TURNS", 2)
     client = scripted(call("nope", {}, "c1"), call("answer", {"value": "4"}, "c2"))
     state = graph.run("q", client, CTX)
 
-    assert [len(specs) for specs in client.specs] == [len(tools.SPECS), 1]
-    assert client.specs[1] == [tools.ANSWER_SPEC]
+    assert client.specs[1] == tools.FINAL_SPECS
+    assert [s["function"]["name"] for s in client.specs[1]] == ["python", "answer"]
     assert client.calls[1][-1] == {"role": "user",
                                    "content": policy.FINAL_NUDGE}
     assert state["turns"] == 2
     assert state["final_nudged"] is True
     assert state["answer"] == "4"
     assert len(client.calls) == 2  # no turn after the answer
+
+
+def test_final_phase_allows_python_on_the_first_final_turn_then_forces_answer(monkeypatch):
+    monkeypatch.setattr(policy, "MAX_TURNS", 3)
+    monkeypatch.setattr(policy, "FINAL_TURNS", 2)
+    monkeypatch.setattr(tools, "dispatch", lambda name, args, ctx: "computed 4")
+    client = scripted(call("python", {"code": "collect"}, "c1"),
+                      call("python", {"code": "compute"}, "c2"),
+                      call("answer", {"value": "4"}, "c3"))
+    state = graph.run("q", client, CTX)
+
+    assert client.specs[1] == tools.FINAL_SPECS
+    assert client.specs[2] == [tools.ANSWER_SPEC]
+    results = [m for m in state["messages"] if m.get("role") == "tool"]
+    assert results[-2]["content"] == "computed 4"
+    assert state["turns"] == 3
+    assert state["answer"] == "4"
+
+
+def test_final_phase_allows_five_python_turns_before_the_forced_answer(monkeypatch):
+    monkeypatch.setattr(policy, "MAX_TURNS", 7)
+    monkeypatch.setattr(policy, "FINAL_TURNS", 6)
+    monkeypatch.setattr(tools, "dispatch", lambda name, args, ctx: "computed 4")
+    replies = [call("python", {"code": "compute"}, f"c{i}") for i in range(1, 7)]
+    replies.append(call("answer", {"value": "4"}, "c7"))
+    client = scripted(*replies)
+    state = graph.run("q", client, CTX)
+
+    assert client.specs[0] == tools.SPECS
+    assert client.specs[1:6] == [tools.FINAL_SPECS] * 5
+    assert client.specs[6] == [tools.ANSWER_SPEC]
+    assert state["turns"] == 7
+    assert state["answer"] == "4"
 
 
 def test_final_phase_appends_the_nudge_once(monkeypatch):
@@ -170,7 +203,8 @@ def test_final_phase_appends_the_nudge_once(monkeypatch):
     nudges = [m for m in state["messages"]
               if m.get("content") == policy.FINAL_NUDGE]
     assert len(nudges) == 1
-    assert all(len(specs) == 1 for specs in client.specs[1:])
+    assert client.specs[1] == tools.FINAL_SPECS
+    assert client.specs[2] == [tools.ANSWER_SPEC]
     assert state["turns"] == 3
     assert state["answer"] == "UNKNOWN"
 
@@ -181,7 +215,7 @@ def test_final_phase_content_reply_is_the_text_fallback(monkeypatch):
     client = scripted({"role": "assistant", "content": " 42 "})
     state = graph.run("q", client, CTX)
 
-    assert client.specs[0] == [tools.ANSWER_SPEC]
+    assert client.specs[0] == tools.FINAL_SPECS
     assert state["turns"] == 1
     assert state["answer"] == "42"
 

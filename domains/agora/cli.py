@@ -113,12 +113,13 @@ def _client():
         request = {"model": MODEL, "messages": messages, "tools": specs,
                    "temperature": policy.TEMPERATURE,
                    "max_tokens": policy.MAX_TOKENS}
-        names = [(spec.get("function") or {}).get("name") for spec in specs]
-        if names == ["answer"]:
-            # The final phase must commit. The graph offers only this tool; the
-            # provider must not leave the model free to keep researching.
+        if specs == [tools.ANSWER_SPEC]:
+            # The forced answer: the provider must not let the model continue.
             request["tool_choice"] = {"type": "function",
                                       "function": {"name": "answer"}}
+        elif specs == tools.FINAL_SPECS:
+            # Final-phase calls before the last: python or answer, not text.
+            request["tool_choice"] = "required"
         try:
             reply = endpoint.chat.completions.create(**request)
         except (BadRequestError, UnprocessableEntityError) as exc:

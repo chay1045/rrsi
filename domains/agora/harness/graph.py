@@ -7,7 +7,8 @@ back to the model. Tests pass a scripted callable; cli.py passes one that wraps
 the OpenAI client.
 
 The last ``policy.FINAL_TURNS`` calls form a bounded final phase: one nudge is
-appended and the client receives only the answer tool.
+appended; earlier final calls may use python, and the last call receives only
+the answer tool.
 """
 
 from __future__ import annotations
@@ -75,7 +76,12 @@ def build(client=None, ctx: tools.Context | None = None):
         specs = tools.SPECS
         update: dict = {"turns": state["turns"] + 1}
         if _final_phase(state):
-            specs = [tools.ANSWER_SPEC]
+            if state["turns"] >= policy.MAX_TURNS - 1:
+                # The last allowed call: commit.
+                specs = [tools.ANSWER_SPEC]
+            else:
+                # Earlier final calls: allow python, but only answer or python.
+                specs = tools.FINAL_SPECS
             if not state.get("final_nudged"):
                 messages = messages + [{"role": "user",
                                         "content": policy.FINAL_NUDGE}]

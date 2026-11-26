@@ -175,7 +175,7 @@ def _fake_endpoint(monkeypatch, completions):
     return openai
 
 
-def test_client_forces_answer_only_in_the_final_phase(monkeypatch):
+def test_client_forces_answer_and_allows_python_in_the_final_phase(monkeypatch):
     requests = []
 
     class Completions:
@@ -188,12 +188,14 @@ def test_client_forces_answer_only_in_the_final_phase(monkeypatch):
     monkeypatch.setenv("RRSI_API_KEY", "dummy")
     client = cli._client()
 
+    client([{"role": "user", "content": "q"}], cli.tools.FINAL_SPECS)
     client([{"role": "user", "content": "q"}], [cli.tools.ANSWER_SPEC])
     client([{"role": "user", "content": "q"}], cli.tools.SPECS)
 
-    assert requests[0]["tool_choice"] == {
+    assert requests[0]["tool_choice"] == "required"
+    assert requests[1]["tool_choice"] == {
         "type": "function", "function": {"name": "answer"}}
-    assert "tool_choice" not in requests[1]
+    assert "tool_choice" not in requests[2]
 
 
 def test_client_reports_a_rejected_tool_choice_and_retries_once(monkeypatch, capsys):
