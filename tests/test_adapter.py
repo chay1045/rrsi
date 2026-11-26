@@ -117,6 +117,25 @@ def test_guard_scan_rejects_url_and_network_client(tmp_path):
     assert ADAPTER._scan_harness(ROOT) == []
 
 
+def test_guard_scan_rejects_a_reranker_endpoint_override(tmp_path):
+    harness = tmp_path / "domains" / "agora" / "harness"
+    harness.mkdir(parents=True)
+    (harness / "policy.py").write_text(
+        "import os\nRERANK = True\nURL = os.environ['AGORA_RERANK_URL']\n",
+        encoding="utf-8")
+
+    hits = ADAPTER._scan_harness(tmp_path)
+    assert any("reranker endpoint override" in hit for hit in hits)
+
+
+def test_env_args_forward_the_reranker_endpoint(monkeypatch):
+    monkeypatch.setenv("AGORA_RERANK_URL", "http://127.0.0.1:9001/score")
+    monkeypatch.setenv("AGORA_RERANK_MODEL", "Qwen3-Reranker-0.6B")
+    args = ADAPTER._env_args()
+    assert "AGORA_RERANK_URL=http://127.0.0.1:9001/score" in args
+    assert "AGORA_RERANK_MODEL=Qwen3-Reranker-0.6B" in args
+
+
 def test_stage_task_redacts_gold_and_keeps_one_domain(tmp_path, corpus):
     task = ADAPTER.task_map()[("Finance & Economics", "q_0001")]
     task_file = ADAPTER._stage_task(tmp_path / "stage", task)

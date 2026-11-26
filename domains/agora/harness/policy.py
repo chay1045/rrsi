@@ -5,6 +5,11 @@ tokenizer, and 4 chars/token keeps the estimate one line.
 """
 
 K = 5                    # search_docs hits per call
+RERANK = False           # cross-encoder rescoring of the RRF top-50. Measured
+                         # on Gate 2 (issue #15): file recall -0.039, 95% CI
+                         # [-0.075, -0.003], and +0.98 s/search. Keep it off;
+                         # see docs/retrieval.md. The service is
+                         # scripts/serve_rerank.sh.
 MAX_TURNS = 400          # model calls per episode. The cloud 100-turn smoke took
                          # 308 s, so 400 (~21 min) fits the 3600 s task timeout.
                          # The local 100-turn H0 is recorded at 42cfea4; local

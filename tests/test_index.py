@@ -124,6 +124,34 @@ def test_embedded_domain_tables_and_knn(tmp_path):
         fused = search.reciprocal_rank_fusion(
             [search.bm25_chunks(con, "zebra", 2), hits], k=2)
         assert fused and fused[0][1].endswith("/b.md")
+
+        # RRF alone ties, and chunk id puts a.md first; a cross-encoder that
+        # prefers zebra must reverse that and still cap at k.
+        class PreferZebra:
+            def __init__(self):
+                self.documents = []
+
+            def score(self, query, documents):
+                self.documents.append(list(documents))
+                return [1.0 if "zebra" in text else 0.0 for text in documents]
+
+        plain = search.hybrid_chunks(
+            con, "alpha", FakeEmbedder.vector("zebra"), k=2)
+        assert plain[0][1].endswith("/a.md")
+
+        cross = PreferZebra()
+        reranked = search.hybrid_chunks(
+            con, "alpha", FakeEmbedder.vector("zebra"), k=1, reranker=cross)
+        assert len(reranked) == 1 and reranked[0][1].endswith("/b.md")
+        assert any("zebra" in text for text in cross.documents[0])
+
+        class Tied:
+            def score(self, query, documents):
+                return [0.0] * len(documents)
+
+        assert search.hybrid_chunks(
+            con, "alpha", FakeEmbedder.vector("zebra"), k=2, reranker=Tied()
+        ) == plain
     finally:
         con.close()
 

@@ -92,6 +92,7 @@ _GUARD_PATTERNS = [
     (re.compile(r"\bapi[_-]?key\b", re.IGNORECASE), "credential reference"),
     (re.compile(r"\bAGORA_INDEX\b"), "index path override"),
     (re.compile(r"\bAGORA_EMBEDDER\b"), "embedder path override"),
+    (re.compile(r"\bAGORA_RERANK[A-Z_]*\b"), "reranker endpoint override"),
     (re.compile(r"(?<![\w])/out(?:/|\b)"), "grader output path"),
     (re.compile(r"\banswer\.txt\b"), "grader answer file"),
     (re.compile(r"\btrajectory\.json\b"), "grader trajectory file"),
@@ -252,7 +253,8 @@ def _require_image(image: str) -> str:
 
 def _env_args() -> list[str]:
     """Only the variables the episode needs. Never forward the host env."""
-    names = ("AGORA_MODEL", "OPENAI_BASE_URL", "OPENAI_API_KEY", "AGORA_LIVE")
+    names = ("AGORA_MODEL", "OPENAI_BASE_URL", "OPENAI_API_KEY", "AGORA_LIVE",
+             "AGORA_RERANK_URL", "AGORA_RERANK_MODEL")
     args: list[str] = []
     for name in names:
         value = os.environ.get(name)
@@ -633,6 +635,7 @@ def _build_critic_patterns() -> list:
         (r"\bAPI_BASE\b", "API_BASE endpoint in diff"),
         (r"(?i)\bAGORA_INDEX\b", "index path override in diff"),
         (r"(?i)\bAGORA_EMBEDDER\b", "embedder path override in diff"),
+        (r"(?i)\bAGORA_RERANK[A-Z_]*\b", "reranker endpoint override in diff"),
         (r"(?<![\w])/out(?:/|\b)", "grader output path in diff"),
         (r"(?i)\banswer\.txt\b", "grader answer file in diff"),
         (r"(?i)\btrajectory\.json\b", "grader trajectory file in diff"),

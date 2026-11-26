@@ -55,7 +55,8 @@ def search_docs(query: str, k: int | None = None, ctx: Context = None) -> str:
     k = min(max(int(k or policy.K), 1), policy.K)
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
-        hits = index_search.hybrid_search(con, query, k)
+        reranker = index_search.default_reranker() if policy.RERANK else None
+        hits = index_search.hybrid_search(con, query, k, reranker=reranker)
         blocks = []
         for position, (doc_path, line_start, line_end) in enumerate(hits, 1):
             row = con.execute(
