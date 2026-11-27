@@ -422,6 +422,34 @@ def test_budget_compacts_older_turns_into_one_summary(monkeypatch):
     assert state["answer"] == "1"
 
 
+def test_summary_input_is_bounded_when_a_turn_overshoots(monkeypatch):
+    monkeypatch.setattr(policy, "MAX_TURNS", 16)
+    monkeypatch.setattr(policy, "FINAL_TURNS", 0)
+    monkeypatch.setattr(policy, "CONTEXT_WINDOW", 12000)
+    monkeypatch.setattr(policy, "CONTEXT_TOKENS", 10200)
+    monkeypatch.setattr(policy, "KEEP_RECENT_TOKENS", 500)
+    monkeypatch.setattr(policy, "SUMMARY_MAX_TOKENS", 2000)
+    monkeypatch.setattr(policy, "CHARS_PER_TOKEN", 1.0)
+    monkeypatch.setattr(tools, "SPECS", [{"type": "function", "function": {
+        "name": "grep", "description": "", "parameters": {}}}])
+    monkeypatch.setattr(tools, "dispatch", lambda name, args, ctx: "x" * 900)
+
+    requests = []
+
+    def summarize(request):
+        requests.append(request)
+        return {"content": "ok"}
+
+    replies = [call("grep", {"pattern": f"q{i}"}, f"c{i}") for i in range(12)]
+    replies.append(call("answer", {"value": "1"}, "c99"))
+    state = graph.run("q", scripted(*replies), CTX, summarize=summarize)
+
+    limit = int((12000 - 2000 - 4096) * 1.0 * 0.9)
+    assert requests and all(len(request) <= limit for request in requests)
+    assert state["compactions"][0]["dropped_unsummarized"] > 0
+    assert state["answer"] == "1"
+
+
 def test_failed_summary_falls_back_and_keeps_the_episode_alive(monkeypatch):
     monkeypatch.setattr(policy, "MAX_TURNS", 8)
     monkeypatch.setattr(policy, "FINAL_TURNS", 0)

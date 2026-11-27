@@ -166,12 +166,39 @@ def build(client=None, ctx: tools.Context | None = None, summarize=None,
             error = "summary unavailable"
         else:
             try:
+                task = (state.get("task")
+                        or str((messages[1] if len(messages) > 1 else {})
+                               .get("content") or ""))
+                previous = context.previous_summary(older)
+                body = [message for message in older
+                        if not context.is_summary(message)]
+                notes_text = notes() if notes is not None else None
+                # The summary request must itself fit: its input plus the
+                # output cap and a small reserve. A turn that adds several
+                # large tool results can overshoot the agent trigger, so drop
+                # the oldest blocks from the summary input if needed. The
+                # dropped turns are recorded; the previous summary still covers
+                # them when one exists.
+                ratio = context.chars_per_token(anchor)
+                # The summary prompt has a different mix from the agent prompt,
+                # so keep a 10% char margin plus 4k tokens for the system
+                # message and template. Overrunning this would reject the one
+                # call that is supposed to save the episode.
+                limit = int((policy.CONTEXT_WINDOW - policy.SUMMARY_MAX_TOKENS
+                             - 4096) * ratio * 0.9)
+                dropped = 0
                 request = context.summary_request(
-                    state.get("task") or str((messages[1] if len(messages) > 1
-                                              else {}).get("content") or ""),
-                    context.render_transcript(older),
-                    context.previous_summary(older),
-                    notes() if notes is not None else None)
+                    task, context.render_transcript(body), previous, notes_text)
+                while len(request) > limit and body:
+                    trimmed = context.drop_oldest_block(body)
+                    if len(trimmed) == len(body):
+                        break
+                    dropped += len(body) - len(trimmed)
+                    body = trimmed
+                    request = context.summary_request(
+                        task, context.render_transcript(body), previous,
+                        notes_text)
+                event["dropped_unsummarized"] = dropped
                 result = summarize(request)
                 if isinstance(result, str):
                     result = {"content": result}

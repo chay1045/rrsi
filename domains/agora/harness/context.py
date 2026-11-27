@@ -107,7 +107,23 @@ def without_older(messages: list[dict], cut: int) -> list[dict]:
     return messages[:2] + messages[cut:]
 
 
-def _is_summary(message: dict) -> bool:
+def drop_oldest_block(messages: list[dict]) -> list[dict]:
+    """Drop the oldest assistant message and the tool results it asked for.
+
+    Used only to fit the summary request in the window. Dropping a single
+    message could leave an orphan tool result, so the call and its results go
+    together.
+    """
+    for start, message in enumerate(messages):
+        if message.get("role") == "assistant":
+            end = start + 1
+            while end < len(messages) and messages[end].get("role") == "tool":
+                end += 1
+            return messages[:start] + messages[end:]
+    return messages[1:] if messages else messages
+
+
+def is_summary(message: dict) -> bool:
     return (message.get("role") == "user"
             and str(message.get("content") or "").startswith(SUMMARY_PREFIX))
 
@@ -115,7 +131,7 @@ def _is_summary(message: dict) -> bool:
 def previous_summary(older: list[dict]) -> str | None:
     """The checkpoint the previous compaction inserted, if it is in ``older``."""
     for message in older:
-        if _is_summary(message):
+        if is_summary(message):
             text = str(message.get("content") or "")[len(SUMMARY_PREFIX):].strip()
             if text.startswith("<summary>"):
                 text = text[len("<summary>"):].lstrip()
@@ -134,7 +150,7 @@ def render_transcript(messages: list[dict]) -> str:
     """A readable transcript for the summarizer. Thinking is never present."""
     blocks = []
     for message in messages:
-        if _is_summary(message):
+        if is_summary(message):
             continue
         role = message.get("role")
         content = str(message.get("content") or "").strip()
