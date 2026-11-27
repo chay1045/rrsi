@@ -42,14 +42,14 @@ The only evolvable directory is `domains/agora/harness/`. It contains:
 
 - `graph.py` — the LangGraph loop, routing and stop conditions;
 - `prompts.py` — the system prompt;
-- `context.py` — prompt packing and trimming;
+- `context.py` — prompt packing and compaction;
 - `tools.py` — `search_docs`, `read_file`, `grep`, `python` and `answer`;
-- `policy.py` — declarative knobs: `K`, `MAX_TURNS`, character caps,
-  `TEMPERATURE`, `MAX_TOKENS`;
+- `policy.py` — declarative knobs: `K`, `MAX_TURNS`, tool-output caps, the
+  token budget, `TEMPERATURE`, `MAX_TOKENS`;
 - new `.py`, `.txt`, `.md` or `.json` modules that the harness imports.
 
 You may change retrieval depth, query construction, snippet size, tool-output
-caps, context trimming, turn limits, routing, verification steps and prompt
+caps, context compaction, turn limits, routing, verification steps and prompt
 mechanics. Prefer a mechanism over motivational wording.
 
 ## What you must preserve
@@ -85,7 +85,7 @@ on the hot path can invalidate the whole candidate.
 3. **No network.** No URL, endpoint, credential, socket or network client.
    The tool surface is the only permitted way to read the corpus.
 4. **Do not disable safety without a working replacement.** The `answer` tool,
-   the turn cap, the context trimmer and the tool-output caps exist for a
+   the turn cap, the compaction trigger and the tool-output caps exist for a
    reason. Replace them; do not remove them.
 5. **Never jeopardize termination.** Every added check must be bounded. An
    episode that never submits an answer scores zero.
@@ -124,7 +124,7 @@ RRSI tags each edit with a fixed component. Use the tag that matches the diff:
   search with `grep` and `read_file`. RRSI has no separate retrieval tag.
 - **`output_plumbing`** — how tool results are shaped before the model sees
   them: snippet size, line ranges, truncation markers, table rendering.
-- **`context_mgmt`** — prompt packing and trimming: what evidence survives,
+- **`context_mgmt`** — prompt packing and compaction: what evidence survives,
   what is dropped first, how the task prompt and computed values are protected.
 - **`control_flow`** — routing and stop conditions: when to search, read,
   compute or answer; retry and verification passes; turn budget.

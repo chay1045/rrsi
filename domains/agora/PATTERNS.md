@@ -120,9 +120,12 @@ checkable action, not motivational text.
 ## P4. Grep output floods the context
 
 **Mechanism.** `grep` caps the number of matching lines, not the number of
-characters. One long line or forty long lines can consume most of
-`CONTEXT_CHARS=48000` in a single result. The trimmer then drops the oldest tool
-blocks, which can include the search that found the right file.
+characters. One long line or forty long lines can consume a large share of the
+prompt in a single result. The old trimmer dropped the oldest tool blocks, which
+could include the search that found the right file. The current harness keeps
+history append-only until 85% of the window, then replaces the older part with
+one summary; a giant result still brings that compaction forward and costs a
+re-prefill.
 
 **Evidence.**
 - task: `Healthcare & Medicine/q_0024`
@@ -132,7 +135,7 @@ blocks, which can include the search that found the right file.
 ```text
 [step 8] TOOL_CALL grep({"pattern":"repeat.*posit|same care area|reset.*window"})
          -> 38,431 chars in one tool result
-CONTEXT_CHARS = 48000
+# at the time: CONTEXT_CHARS = 48000
 ```
 
 `Agriculture, Resources & Energy/q_0030` returned 16,668 and 30,758 characters
