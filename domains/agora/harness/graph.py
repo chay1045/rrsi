@@ -14,14 +14,21 @@ matches the previous request except for the newest turn. At the budget,
 the graph stays model- and endpoint-agnostic; ``notes`` reads notes.md for the
 summary input.
 
-The last ``policy.FINAL_TURNS`` calls form a bounded final phase. The tool list
-never changes, because the template renders it before the first message: a
-changed list would invalidate the whole prefix. The phase is enforced with
-``tool_choice`` and one nudge; the last call accepts only ``answer``.
+The last ``policy.FINAL_TURNS`` calls form a bounded final phase. The first
+``policy.FINAL_TURNS - 1`` calls may use any tool; the last call accepts only
+``answer``. The tool list never changes, because the template renders it before
+the first message: a changed list would invalidate the whole prefix. The phase
+is enforced with ``tool_choice`` and one nudge that states the calls left.
+
+Repeat detection keys on evidence, not arguments. A call is a repeat only when
+the same call returned the same result and no call in between returned a
+different result. The repeat nudge is sent once per call key and is not stored
+in the history, so later turns do not replay it.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import TypedDict
 
@@ -30,16 +37,13 @@ from langgraph.graph import END, StateGraph
 from . import context, policy, prompts, tools
 
 
-_RECENT_CALLS = 20       # exact-repeat detection window
-
-
 class State(TypedDict, total=False):
     messages: list[dict]
     task: str
     turns: int
     empty_retries: int
     final_nudged: bool
-    recent_calls: list[str]
+    recent_calls: list[dict]
     repeat_nudged: str | None
     answer: str
     answered: bool
@@ -56,7 +60,7 @@ def _tool_message(call: dict, content: str) -> dict:
 
 
 def _call_key(name: str, arguments: str | None) -> str:
-    """Canonical ``name + arguments`` key for exact duplicate detection.
+    """Canonical ``name + arguments`` key for repeat detection.
 
     Argument order and the provider's whitespace-padded keys are normalized so
     the same call hashes the same way across turns. Invalid JSON is kept as
@@ -72,20 +76,36 @@ def _call_key(name: str, arguments: str | None) -> str:
                       ensure_ascii=False)
 
 
-def _repeated_call_nudge(state: State) -> str | None:
-    """The nudge when the latest call reaches REPEAT_LIMIT occurrences.
+def _result_hash(output: str) -> str:
+    """Stable digest of one tool result for no-progress detection."""
+    return hashlib.sha256(output.encode("utf-8", "replace")).hexdigest()
 
-    The same key is nudged once. Another repeated call can trigger its own
-    nudge, but a model that ignores the first one does not grow the prompt with
-    an identical message every turn.
+
+def _no_progress_nudge(state: State) -> str | None:
+    """The nudge when the latest call returns evidence already seen.
+
+    The latest call must match an earlier call with the same normalized key and
+    the same result hash. A different result between the two occurrences is new
+    evidence, so it resets the loop: a search after a read is allowed. The same
+    key is nudged once, so an ignored nudge does not grow the prompt every turn.
     """
     recent = state.get("recent_calls") or []
-    if len(recent) < policy.REPEAT_LIMIT:
+    if len(recent) < 2:
         return None
-    key = recent[-1]
-    if recent.count(key) < policy.REPEAT_LIMIT:
+    latest = recent[-1]
+    previous = None
+    for index in range(len(recent) - 2, -1, -1):
+        record = recent[index]
+        if (record.get("key") == latest.get("key")
+                and record.get("result") == latest.get("result")):
+            previous = index
+            break
+    if previous is None:
         return None
-    if state.get("repeat_nudged") == key:
+    if any(record.get("result") != latest.get("result")
+           for record in recent[previous + 1:-1]):
+        return None
+    if state.get("repeat_nudged") == latest.get("key"):
         return None
     return policy.REPEAT_NUDGE
 
@@ -261,6 +281,7 @@ def build(client=None, ctx: tools.Context | None = None, summarize=None,
         specs = tools.SPECS
         update: dict = {"turns": state["turns"] + 1}
         nudge = None
+        ephemeral = None
         force = None
         if _final_phase(state):
             if state["turns"] >= policy.MAX_TURNS - 1:
@@ -269,25 +290,31 @@ def build(client=None, ctx: tools.Context | None = None, summarize=None,
                 force = "answer"
                 nudge = policy.FINAL_ANSWER_NUDGE
             else:
-                # Earlier final calls: python is still available, and a call
-                # other than answer is required.
+                # Earlier final calls: any tool is available. The last call is
+                # the only one that must answer.
                 force = "required"
                 if not state.get("final_nudged"):
-                    nudge = policy.FINAL_NUDGE
+                    nudge = policy.FINAL_NUDGE.format(
+                        turns_left=policy.MAX_TURNS - state["turns"])
                     update["final_nudged"] = True
         else:
-            repeat = _repeated_call_nudge(state)
+            repeat = _no_progress_nudge(state)
             if repeat:
-                nudge = repeat
-                update["repeat_nudged"] = state["recent_calls"][-1]
+                # The repeat nudge is ephemeral: the client sees it once, but
+                # it never enters the transcript and is not replayed.
+                ephemeral = repeat
+                update["repeat_nudged"] = state["recent_calls"][-1].get("key")
         if nudge:
             messages = messages + [{"role": "user", "content": nudge}]
         messages, compacted, predicted = _maybe_compact(state, messages, specs)
         update.update(compacted)
-        reply = dict(client(messages, specs, force=force))
+        request = messages
+        if ephemeral:
+            request = request + [{"role": "user", "content": ephemeral}]
+        reply = dict(client(request, specs, force=force))
         update["messages"] = messages + [reply]
         usage = reply.get("usage")
-        anchor = _anchor(messages, specs, usage)
+        anchor = _anchor(request, specs, usage)
         if anchor:
             update["anchor"] = anchor
         if isinstance(usage, dict):
@@ -311,9 +338,9 @@ def build(client=None, ctx: tools.Context | None = None, summarize=None,
         recent = list(state.get("recent_calls") or [])
         for call in call_message.get("tool_calls") or []:
             name = call["function"]["name"]
-            recent.append(_call_key(name, call["function"].get("arguments")))
+            arguments = call["function"].get("arguments")
             try:
-                args = json.loads(call["function"].get("arguments") or "{}")
+                args = json.loads(arguments or "{}")
                 if isinstance(args, dict):
                     # Some providers leak whitespace into argument keys, e.g.
                     # ``" path"``. The tool names are fixed, so normalize keys
@@ -328,9 +355,11 @@ def build(client=None, ctx: tools.Context | None = None, summarize=None,
                     output = tools.dispatch(name, args, ctx)
             except Exception as exc:  # a tool bug is evidence, not a crash
                 output = f"error: {type(exc).__name__}: {exc}"
+            recent.append({"key": _call_key(name, arguments),
+                           "result": _result_hash(str(output))})
             results.append(_tool_message(call, str(output)))
         update: dict = {"messages": state["messages"] + results,
-                        "recent_calls": recent[-_RECENT_CALLS:]}
+                        "recent_calls": recent[-policy.REPEAT_WINDOW:]}
         if answer is not None:
             update["answer"] = answer
         return update

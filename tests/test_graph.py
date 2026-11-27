@@ -47,6 +47,10 @@ def scripted(*replies):
 CTX = tools.Context(domain="Finance & Economics")
 
 
+def final_nudge(turns_left):
+    return policy.FINAL_NUDGE.format(turns_left=turns_left)
+
+
 def test_answer_tool_terminates():
     client = scripted(call("answer", {"value": "10.37 pp"}))
     state = graph.run("what is the margin?", client, CTX)
@@ -203,18 +207,17 @@ def test_empty_turn_at_the_turn_cap_does_not_retry(monkeypatch):
     assert len(client.calls) == 1
 
 
-def test_duplicate_call_appends_one_repeat_nudge(monkeypatch):
+def test_duplicate_call_sends_one_ephemeral_repeat_nudge(monkeypatch):
     monkeypatch.setattr(tools, "dispatch", lambda name, args, ctx: "same")
     client = scripted(call("grep", {"pattern": "x"}, "c1"),
                       call("grep", {"pattern": "x"}, "c2"),
                       call("answer", {"value": "1"}, "c3"))
     state = graph.run("q", client, CTX)
 
-    nudges = [m for m in state["messages"]
-              if m.get("content") == policy.REPEAT_NUDGE]
-    assert len(nudges) == 1
     assert client.calls[2][-1] == {"role": "user",
                                    "content": policy.REPEAT_NUDGE}
+    assert not any(m.get("content") == policy.REPEAT_NUDGE
+                   for m in state["messages"])
     assert state["answer"] == "1"
 
 
@@ -222,22 +225,25 @@ def test_repeated_identical_calls_produce_one_nudge(monkeypatch):
     monkeypatch.setattr(tools, "dispatch", lambda name, args, ctx: "same")
     replies = [call("grep", {"pattern": "x"}, f"c{i}") for i in range(4)]
     replies.append(call("answer", {"value": "1"}, "c5"))
-    state = graph.run("q", scripted(*replies), CTX)
+    client = scripted(*replies)
+    state = graph.run("q", client, CTX)
 
     assert sum(m.get("content") == policy.REPEAT_NUDGE
-               for m in state["messages"]) == 1
+               for request in client.calls for m in request) == 1
+    assert not any(m.get("content") == policy.REPEAT_NUDGE
+                   for m in state["messages"])
 
 
-def test_distinct_calls_do_not_append_the_repeat_nudge(monkeypatch):
+def test_distinct_calls_do_not_send_the_repeat_nudge(monkeypatch):
     monkeypatch.setattr(tools, "dispatch", lambda name, args, ctx: "ok")
     client = scripted(call("grep", {"pattern": "x"}, "c1"),
                       call("grep", {"pattern": "y"}, "c2"),
                       call("grep", {"pattern": "x", "path": "b.md"}, "c3"),
                       call("answer", {"value": "1"}, "c4"))
-    state = graph.run("q", client, CTX)
+    graph.run("q", client, CTX)
 
     assert not any(m.get("content") == policy.REPEAT_NUDGE
-                   for m in state["messages"])
+                   for request in client.calls for m in request)
 
 
 def test_repeat_detection_normalizes_argument_order_and_keys(monkeypatch):
@@ -245,10 +251,10 @@ def test_repeat_detection_normalizes_argument_order_and_keys(monkeypatch):
     client = scripted(call("grep", {" pattern": "x", "path": "a.md"}, "c1"),
                       call("grep", {"path": "a.md", "pattern": "x"}, "c2"),
                       call("answer", {"value": "1"}, "c3"))
-    state = graph.run("q", client, CTX)
+    graph.run("q", client, CTX)
 
     assert sum(m.get("content") == policy.REPEAT_NUDGE
-               for m in state["messages"]) == 1
+               for request in client.calls for m in request) == 1
 
 
 def test_recent_calls_keeps_the_last_twenty(monkeypatch):
@@ -257,7 +263,62 @@ def test_recent_calls_keeps_the_last_twenty(monkeypatch):
     replies.append(call("answer", {"value": "1"}, "c26"))
     state = graph.run("q", scripted(*replies), CTX)
 
-    assert len(state["recent_calls"]) == 20
+    assert len(state["recent_calls"]) == policy.REPEAT_WINDOW
+    assert all(set(record) == {"key", "result"}
+               for record in state["recent_calls"])
+
+
+def test_repeated_search_after_new_evidence_is_allowed(monkeypatch):
+    def dispatch(name, args, ctx):
+        return "A" if name == "search_docs" else "B"
+
+    monkeypatch.setattr(tools, "dispatch", dispatch)
+    client = scripted(call("search_docs", {"query": "q"}, "c1"),
+                      call("read_file", {"path": "a.md"}, "c2"),
+                      call("search_docs", {"query": "q"}, "c3"),
+                      call("answer", {"value": "1"}, "c4"))
+    graph.run("q", client, CTX)
+
+    assert not any(m.get("content") == policy.REPEAT_NUDGE
+                   for request in client.calls for m in request)
+
+
+def test_repeated_call_with_changed_result_is_allowed(monkeypatch):
+    outputs = iter(["A", "B"])
+    monkeypatch.setattr(tools, "dispatch",
+                        lambda name, args, ctx: next(outputs))
+    client = scripted(call("search_docs", {"query": "q"}, "c1"),
+                      call("search_docs", {"query": "q"}, "c2"),
+                      call("answer", {"value": "1"}, "c3"))
+    graph.run("q", client, CTX)
+
+    assert not any(m.get("content") == policy.REPEAT_NUDGE
+                   for request in client.calls for m in request)
+
+
+def test_reworded_search_with_the_same_result_is_allowed(monkeypatch):
+    monkeypatch.setattr(tools, "dispatch", lambda name, args, ctx: "A")
+    client = scripted(call("search_docs", {"query": "q1"}, "c1"),
+                      call("search_docs", {"query": "q2"}, "c2"),
+                      call("answer", {"value": "1"}, "c3"))
+    graph.run("q", client, CTX)
+
+    assert not any(m.get("content") == policy.REPEAT_NUDGE
+                   for request in client.calls for m in request)
+
+
+def test_repeated_search_with_unchanged_result_is_nudged_once(monkeypatch):
+    monkeypatch.setattr(tools, "dispatch", lambda name, args, ctx: "A")
+    replies = [call("search_docs", {"query": "q"}, f"c{i}") for i in range(4)]
+    replies.append(call("answer", {"value": "1"}, "c4"))
+    client = scripted(*replies)
+    state = graph.run("q", client, CTX)
+
+    assert sum(m.get("content") == policy.REPEAT_NUDGE
+               for request in client.calls for m in request) == 1
+    assert not any(m.get("content") == policy.REPEAT_NUDGE
+                   for m in state["messages"])
+    assert state["answer"] == "1"
 
 
 def test_repeat_nudge_is_not_appended_in_the_final_phase(monkeypatch):
@@ -271,7 +332,7 @@ def test_repeat_nudge_is_not_appended_in_the_final_phase(monkeypatch):
 
     contents = [m.get("content") for m in state["messages"]]
     assert policy.REPEAT_NUDGE not in contents
-    assert contents.count(policy.FINAL_NUDGE) == 1
+    assert contents.count(final_nudge(2)) == 1
     assert client.calls[-1][-1] == {"role": "user",
                                     "content": policy.FINAL_ANSWER_NUDGE}
 
@@ -301,7 +362,7 @@ def test_final_phase_keeps_the_tool_list_and_restricts_the_choice(monkeypatch):
     assert client.specs[1] == tools.SPECS
     assert client.forces[1] == "required"
     assert client.calls[1][-1] == {"role": "user",
-                                   "content": policy.FINAL_NUDGE}
+                                   "content": final_nudge(2)}
     assert state["turns"] == 2
     assert state["final_nudged"] is True
     assert state["answer"] == "4"
@@ -344,6 +405,35 @@ def test_final_phase_allows_five_python_turns_before_the_forced_answer(monkeypat
     assert state["answer"] == "4"
 
 
+def test_default_final_turns_is_eleven():
+    assert policy.FINAL_TURNS == 11
+
+
+def test_system_prompt_states_the_budget_is_finite():
+    assert "generous but finite" in graph.prompts.SYSTEM
+
+
+def test_final_phase_allows_ten_tool_turns_before_the_forced_answer(monkeypatch):
+    monkeypatch.setattr(policy, "MAX_TURNS", 12)
+    monkeypatch.setattr(policy, "FINAL_TURNS", 11)
+    monkeypatch.setattr(tools, "dispatch", lambda name, args, ctx: "ok")
+    replies = [call("grep", {"pattern": f"q{i}"}, f"c{i}") for i in range(11)]
+    replies.append(call("answer", {"value": "4"}, "c11"))
+    client = scripted(*replies)
+    state = graph.run("q", client, CTX)
+
+    assert client.specs == [tools.SPECS] * 12
+    assert client.forces[0] is None
+    assert client.forces[1:11] == ["required"] * 10
+    assert client.forces[11] == "answer"
+    assert client.calls[1][-1] == {"role": "user",
+                                   "content": final_nudge(11)}
+    assert client.calls[11][-1] == {"role": "user",
+                                    "content": policy.FINAL_ANSWER_NUDGE}
+    assert state["turns"] == 12
+    assert state["answer"] == "4"
+
+
 def test_final_phase_appends_the_nudge_once(monkeypatch):
     monkeypatch.setattr(policy, "MAX_TURNS", 3)
     monkeypatch.setattr(policy, "FINAL_TURNS", 2)
@@ -352,7 +442,7 @@ def test_final_phase_appends_the_nudge_once(monkeypatch):
     state = graph.run("q", client, CTX)
 
     nudges = [m for m in state["messages"]
-              if m.get("content") == policy.FINAL_NUDGE]
+              if m.get("content") == final_nudge(2)]
     assert len(nudges) == 1
     assert client.forces[1] == "required"
     assert client.forces[2] == "answer"

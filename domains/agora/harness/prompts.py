@@ -26,6 +26,8 @@ unit and scale.
 format against the question.
 
 Rules:
+- Work thoroughly. The episode budget is generous but finite. Do not spend \
+calls on searches or reads that add no new evidence.
 - Reconcile before answering: units, currencies, dates and terminology may \
 differ between documents.
 - Never guess a number you can read or compute.

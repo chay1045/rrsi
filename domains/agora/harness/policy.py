@@ -28,16 +28,17 @@ MAX_TURNS = 150          # model calls per episode. The cloud 100-turn smoke too
                          # The local 100-turn H0 is recorded at 42cfea4; the
                          # longer timeout leaves room for an episode that reaches
                          # the 85% compaction trigger.
-FINAL_TURNS = 6          # last calls of the episode: five may still use python
-                         # to compute the value; the last call requires the answer
-                         # tool through tool_choice. The tool list never changes,
-                         # so the final phase does not invalidate the prompt cache.
-FINAL_NUDGE = ("You have reached the final turns of this episode. Do not search "
-               "or read again. You may use the python tool if the value still "
-               "needs computation. Call the answer tool when the value is ready; "
-               "the last final turn accepts only answer. Submit the value only. "
-               "If you are not certain, submit your best supported value; do not "
-               "guess one.")
+FINAL_TURNS = 11         # last calls of the episode: ten may use any tool
+                         # (search, read, grep, python); the last call requires
+                         # the answer tool through tool_choice. The tool list
+                         # never changes, so the final phase does not invalidate
+                         # the prompt cache.
+FINAL_NUDGE = ("You have reached the final turns of this episode. You have "
+               "{turns_left} model calls left, including this one. You may use "
+               "search, read, grep or python for all but the last call. The last "
+               "call accepts only the answer tool. Submit the value only. If you "
+               "are not certain, submit your best supported value; do not guess "
+               "one.")
 FINAL_ANSWER_NUDGE = ("This is the last final turn. Only the answer tool is "
                       "accepted. Call it now with the final value only. If you are "
                       "not certain, submit your best supported value; do not "
@@ -51,12 +52,11 @@ EMPTY_TURN_RETRIES = 2   # bounded re-prompts when an assistant turn has no cont
                          # and no tool call, instead of ending the episode
 EMPTY_TURN_NUDGE = ("Your last reply was empty. Call one tool now. "
                     "If you have the final value, call answer.")
-REPEAT_LIMIT = 2         # occurrences of one exact name+arguments key in the last
-                         # 20 calls that trigger the repeat nudge
-REPEAT_NUDGE = ("You repeated the same tool call with the same arguments. Do not "
-                "repeat it; it adds no evidence. Read notes.md and reuse what you "
-                "already have, change the query or path, compute with python, or "
-                "call answer if the value is ready.")
+REPEAT_WINDOW = 20       # recent calls kept for no-progress detection
+REPEAT_NUDGE = ("Your last tool call returned the same result as before and "
+                "added no new evidence. Do not repeat it; read notes.md and reuse "
+                "what you already have, change the query or path, compute with "
+                "python, or call answer if the value is ready.")
 
 SNIPPET_CHARS = 1200     # ~300 tokens per search hit
 READ_CHARS = 12000       # one read_file slice (two 6k slices)
