@@ -18,9 +18,11 @@ PLAN.md §5.1 is mandatory here:
 
 from __future__ import annotations
 
+import hashlib
 import os
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Protocol
 
 import numpy as np
 
@@ -31,11 +33,17 @@ DEFAULT_MODEL = Path.home() / "Models" / "embeddinggemma2"
 MODEL_DIR = Path(os.environ.get("AGORA_EMBEDDER") or DEFAULT_MODEL)
 BATCH_SIZE = int(os.environ.get("AGORA_EMBED_BATCH", "32"))
 
+# The chunk budget targets the model's 1024-token local attention window
+# (PLAN.md §5.1). The checkpoint's hard context is larger, but a chunk whose
+# tail sits outside the local window is represented mostly by its head.
+EMBED_MAX_TOKENS = 1024
+
 
 class Embedder(Protocol):
     """The small surface ``build.py`` and ``search.py`` need."""
 
     dims: int
+    id: str
 
     def encode_documents(self, texts: Sequence[str],
                          titles: Sequence[str]) -> np.ndarray:
@@ -43,6 +51,41 @@ class Embedder(Protocol):
 
     def encode_queries(self, texts: Sequence[str]) -> np.ndarray:
         ...
+
+
+class ChunkTokenizer(Protocol):
+    """The tokenizer surface the chunker needs: real token character spans."""
+
+    id: str
+
+    def spans(self, text: str) -> list[tuple[int, int]]:
+        """Character ``(start, end)`` spans of the text's tokens, no specials."""
+        ...
+
+
+class EmbeddingGemmaTokenizer:
+    """The EmbeddingGemma 2 text tokenizer, loaded without the model weights.
+
+    Chunk sizes must use the same tokenizer the embedder applies. A 4-chars
+    estimate overshoots badly: prose here measures ~2.9 chars/token and dense
+    numeric tables ~1.1, so an "800-token" chunk can encode to thousands of
+    real tokens.
+    """
+
+    def __init__(self, model_dir: Path | str = MODEL_DIR):
+        from tokenizers import Tokenizer
+
+        path = Path(model_dir) / "tokenizer.json"
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"no tokenizer at {path}; set AGORA_EMBEDDER or install the model")
+        self._tokenizer = Tokenizer.from_file(str(path))
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+        self.id = f"embeddinggemma2:{digest}"
+
+    def spans(self, text: str) -> list[tuple[int, int]]:
+        encoding = self._tokenizer.encode(text, add_special_tokens=False)
+        return list(encoding.offsets)
 
 
 def query_text(query: str) -> str:
@@ -99,6 +142,9 @@ class EmbeddingGemma:
         if dtype is torch.float16:  # defensive: never let a future edit pick fp16
             raise AssertionError("EmbeddingGemma 2 must not use fp16")
         self.dtype = dtype
+        # dtype changes the vectors; the device does not. Keep the build key
+        # stable across a CPU and a CUDA rebuild of the same precision.
+        self.id = f"embeddinggemma2:{str(dtype).removeprefix('torch.')}/{self.dims}d"
         self.model = SentenceTransformer(
             str(path),
             device=self.device,

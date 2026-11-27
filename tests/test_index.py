@@ -2,6 +2,8 @@
 
     python3 -m pytest -q tests/test_index.py
 """
+import os
+import re
 import sqlite3
 import sys
 from importlib.util import module_from_spec, spec_from_file_location
@@ -19,6 +21,20 @@ sys.modules[spec.name] = build  # dataclasses looks its own module up here
 spec.loader.exec_module(build)
 
 import search  # noqa: E402  (index/ is on sys.path)
+
+
+class WordTokenizer:
+    """Deterministic tokenizer: one token per whitespace-separated word."""
+
+    id = "word-test"
+
+    @staticmethod
+    def spans(text):
+        return [(match.start(), match.end()) for match in re.finditer(r"\S+", text)]
+
+
+TOKENIZER = (Path(os.environ.get("AGORA_EMBEDDER") or
+                  Path.home() / "Models" / "embeddinggemma2") / "tokenizer.json")
 
 
 class FakeEmbedder:
@@ -49,10 +65,11 @@ class NanEmbedder(FakeEmbedder):
 
 
 def test_build_domain_chunks_and_fts(tmp_path):
+    tokenizer = WordTokenizer()
     docs = tmp_path / "docs"
     root = docs / "Test Domain"
     root.mkdir(parents=True)
-    para = "alpha beta gamma delta " * 60  # ~360 estimated tokens
+    para = "alpha beta gamma delta " * 60  # 240 word tokens
     (root / "a.md").write_text(
         "# Intro\n\n" + "\n\n".join([para] * 12) + "\n\n## Tail\n\nzebra 12345.678\n",
         encoding="utf-8")
@@ -61,17 +78,24 @@ def test_build_domain_chunks_and_fts(tmp_path):
         "# 报告\n\n动力电池储能出货高增，同比+98.9%。\n\n---\n\n114\n",
         encoding="utf-8")
 
-    counts, n_chunks, db = build.build_domain("Test Domain", docs, tmp_path / "index")
+    counts, n_chunks, db, key = build.build_domain(
+        "Test Domain", docs, tmp_path / "index", tokenizer=tokenizer)
 
     assert counts == {"md": 2, "xlsx": 0, "csv": 1}
+    assert re.fullmatch(r"[0-9a-f]{64}", key)
     con = sqlite3.connect(db)
     rows = con.execute(
         "SELECT doc_path, line_start, line_end, heading_path, text FROM chunks").fetchall()
 
     md = [r for r in rows if r[0].endswith("/a.md")]
-    assert md and all(build.MIN_TOK <= build.n_tokens(r[4]) <= build.MAX_TOK for r in md)
+    sizes = [build.n_tokens(r[4], tokenizer) for r in md]
+    assert md and max(sizes) <= build.MAX_TOK
+    assert max(sizes) >= build.MIN_TOK
+    assert all(r[1] <= r[2] for r in md)
     assert md[0][1] == 1 and md[0][3].startswith("a > Intro")
     assert md[0][2] < md[-1][2]  # line ranges advance through the file
+    assert con.execute(
+        "SELECT value FROM meta WHERE key = 'build_key'").fetchone() == (key,)
 
     hit = con.execute(
         "SELECT c.doc_path, c.heading_path FROM chunks_fts f JOIN chunks c"
@@ -93,12 +117,86 @@ def test_build_domain_chunks_and_fts(tmp_path):
     assert not any(r[4].strip() in {"---", "114"} for r in rows)
 
 
+def test_build_key_is_reproducible_and_tracks_the_corpus(tmp_path):
+    tokenizer = WordTokenizer()
+    docs = tmp_path / "docs"
+    root = docs / "Test Domain"
+    root.mkdir(parents=True)
+    (root / "a.md").write_text("# Alpha\n\nalpha alpha\n", encoding="utf-8")
+
+    _, _, _, first = build.build_domain(
+        "Test Domain", docs, tmp_path / "one", tokenizer=tokenizer)
+    _, _, _, second = build.build_domain(
+        "Test Domain", docs, tmp_path / "two", tokenizer=tokenizer)
+    assert first == second
+
+    (root / "a.md").write_text("# Alpha\n\nalpha alpha changed\n", encoding="utf-8")
+    _, _, _, changed = build.build_domain(
+        "Test Domain", docs, tmp_path / "three", tokenizer=tokenizer)
+    assert changed != first
+
+
 def test_oversized_paragraph_is_split_then_packed():
+    tokenizer = WordTokenizer()
     units = list(build._md_units("# Big\n\n" + "word " * 4000, "big"))
-    ch = build.chunks(units)
-    # per-unit estimates are summed, the joined text re-rounds: allow a few tokens
-    assert max(build.n_tokens(c.text) for c in ch) <= build.MAX_TOK + 8
+    ch = build.chunks(units, tokenizer)
+    assert max(build.n_tokens(c.text, tokenizer) for c in ch) <= build.MAX_TOK
     assert sum(c.text.count("word") for c in ch) >= 4000  # overlap may repeat, nothing lost
+
+
+def test_size_split_has_overlap_and_valid_lines():
+    tokenizer = WordTokenizer()
+    unit = build.Unit("Doc", 1, 1,
+                      "\n".join(["alpha beta gamma delta epsilon zeta eta theta"] * 120))
+    pieces = list(build._fit(unit, tokenizer))
+
+    assert len(pieces) > 1
+    assert all(build.n_tokens(p.text, tokenizer) <= build.MAX_TOK for p in pieces)
+    first_spans = tokenizer.spans(pieces[0].text)
+    overlap = pieces[0].text[first_spans[-build.OVERLAP_TOK][0]:].strip()
+    assert overlap and pieces[1].text.startswith(overlap)
+    assert all(p.line_start <= p.line_end for p in pieces)
+    assert pieces[1].line_start <= pieces[0].line_end  # the overlap keeps lines valid
+
+
+def test_every_flush_starts_the_next_chunk_with_the_tail():
+    tokenizer = WordTokenizer()
+    units = [build.Unit(f"Doc > H{i}", i * 2 + 1, i * 2 + 2, "word " * 300)
+             for i in range(4)]
+    ch = build.chunks(units, tokenizer)
+
+    assert len(ch) > 1
+    tail = ch[0].text.split()[-build.OVERLAP_TOK:]
+    assert tail and ch[1].text.split()[:len(tail)] == tail
+    assert ch[1].line_start <= ch[0].line_end
+
+
+@pytest.mark.skipif(not TOKENIZER.is_file(), reason="embedder tokenizer not installed")
+def test_dense_numeric_table_is_split_by_real_tokens():
+    tokenizer = build.EmbeddingGemmaTokenizer()
+    dense = " | ".join(f"{i}.{i * 7 % 100:02d}" for i in range(1, 351))
+
+    # The old 4-chars estimate would have kept this whole.
+    assert len(dense) // 4 <= build.MAX_TOK
+    assert build.n_tokens(dense, tokenizer) > build.EMBED_MAX_TOKENS
+
+    pieces = list(build._fit(build.Unit("Table", 1, 1, dense), tokenizer))
+    assert len(pieces) > 1
+    assert all(build.n_tokens(p.text, tokenizer) <= build.MAX_TOK for p in pieces)
+
+
+def test_build_rejects_a_chunk_over_the_embedder_window(tmp_path, monkeypatch):
+    tokenizer = WordTokenizer()
+    monkeypatch.setattr(build, "MAX_TOK", 2000)  # let the packer keep a wide chunk
+    docs = tmp_path / "docs"
+    root = docs / "Test Domain"
+    root.mkdir(parents=True)
+    (root / "a.md").write_text("# Big\n\n" + "word " * 1500, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="embedder window"):
+        build.build_domain("Test Domain", docs, tmp_path / "index",
+                           tokenizer=tokenizer)
+    assert not (tmp_path / "index" / "test-domain.sqlite").exists()
 
 
 def test_embedded_domain_tables_and_knn(tmp_path):
@@ -109,8 +207,9 @@ def test_embedded_domain_tables_and_knn(tmp_path):
     (root / "a.md").write_text("# Alpha\n\nalpha alpha\n", encoding="utf-8")
     (root / "b.md").write_text("# Zebra\n\nzebra zebra\n", encoding="utf-8")
 
-    counts, n_chunks, db = build.build_domain(
-        "Test Domain", docs, tmp_path / "index", FakeEmbedder())
+    counts, n_chunks, db, _ = build.build_domain(
+        "Test Domain", docs, tmp_path / "index", FakeEmbedder(),
+        tokenizer=WordTokenizer())
 
     assert counts == {"md": 2, "xlsx": 0, "csv": 0} and n_chunks == 2
     con = sqlite3.connect(db)
@@ -167,6 +266,7 @@ def test_nan_embedding_aborts_build_and_leaves_no_database(tmp_path):
     # Deliberate trigger of the NaN landmine from PLAN §5.1: the build must
     # fail before the vector reaches sqlite-vec, and must not leave a db behind.
     with pytest.raises(ValueError, match="non-finite"):
-        build.build_domain("Test Domain", docs, index_dir, NanEmbedder())
+        build.build_domain("Test Domain", docs, index_dir, NanEmbedder(),
+                           tokenizer=WordTokenizer())
     assert not (index_dir / "test-domain.sqlite").exists()
     assert not (index_dir / "test-domain.sqlite.tmp").exists()

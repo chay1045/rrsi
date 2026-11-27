@@ -15,8 +15,11 @@ rebuilt (or corrupted) by every candidate.
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
+import hashlib
 import io
+import json
 import os
 import re
 import resource
@@ -30,7 +33,9 @@ from pathlib import Path
 import openpyxl
 from openpyxl.utils import get_column_letter
 
-from embed import DIMS, Embedder, EmbeddingGemma, check_vectors
+from embed import (DIMS, EMBED_MAX_TOKENS, ChunkTokenizer, Embedder,
+                   EmbeddingGemma, EmbeddingGemmaTokenizer, check_vectors,
+                   document_text)
 
 DATA_DIR = Path(os.environ.get("AGORA_DATA", Path.home() / "work" / "agora-data"))
 DOCS_DIR = DATA_DIR / "documents"
@@ -42,13 +47,19 @@ INDEX_DIR = (
 
 MIN_TOK, MAX_TOK, OVERLAP_TOK = 512, 800, 80
 STRAY_TOK = 32  # footer/page-number leftovers, folded into a neighbour chunk
+CHUNKER_VERSION = 2  # v1 used the 4-chars/token estimate and single-unit overlap
 SUFFIXES = {".md": "md", ".xlsx": "xlsx", ".csv": "csv"}
 HEADING = re.compile(r"^(#{1,6})\s+(\S.*?)\s*$")
 CJK = re.compile(r"[\u2e80-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]")
 
 SCHEMA = """
+DROP TABLE IF EXISTS meta;
 DROP TABLE IF EXISTS chunks;
 DROP TABLE IF EXISTS chunks_fts;
+CREATE TABLE meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 CREATE TABLE chunks (
     chunk_id INTEGER PRIMARY KEY,
     domain TEXT NOT NULL,
@@ -93,14 +104,9 @@ class Chunk:
     text: str
 
 
-def n_tokens(text: str) -> int:
-    """Cheap token estimate: 1 per CJK character, 1 per 4 other characters.
-
-    shortcut: not the policy tokenizer, just enough to hold the 512-800 window;
-    swap in the real tokenizer if chunk budgets ever need to be exact.
-    """
-    cjk = len(CJK.findall(text))
-    return cjk + (len(text) - cjk) // 4
+def n_tokens(text: str, tokenizer: ChunkTokenizer) -> int:
+    """Real token count from the embedder's tokenizer."""
+    return len(tokenizer.spans(text))
 
 
 def cjk_split(text: str) -> str:
@@ -205,72 +211,120 @@ def _units(path: Path) -> Iterator[Unit]:
         yield from _xlsx_units(path)
 
 
-def _fit(unit: Unit) -> Iterator[Unit]:
-    """Cut a unit that alone exceeds MAX_TOK into pieces (same text, real line spans)."""
-    text = unit.text
-    if n_tokens(text) <= MAX_TOK:
+def _newlines(text: str) -> list[int]:
+    return [i for i, char in enumerate(text) if char == "\n"]
+
+
+def _slice(unit: Unit, start: int, end: int,
+           newlines: list[int] | None = None) -> Unit:
+    """One character slice of a unit, with line numbers clamped to its own span.
+
+    A csv record index is not a line number, so the clamp keeps a split row on
+    its record's line.
+    """
+    piece = unit.text[start:end]
+    if newlines is None:
+        newlines = _newlines(unit.text)
+    first = min(unit.line_end, unit.line_start + bisect.bisect_right(newlines, start))
+    last = min(unit.line_end, first + piece.count("\n"))
+    return Unit(unit.heading_path, first, last, piece.strip())
+
+
+def _fit(unit: Unit, tokenizer: ChunkTokenizer) -> Iterator[Unit]:
+    """Cut an oversized unit into MAX_TOK windows with OVERLAP_TOK of overlap."""
+    spans = tokenizer.spans(unit.text)
+    if len(spans) <= MAX_TOK:
         yield unit
         return
-    pos, line = 0, unit.line_start
-    while pos < len(text):
-        end = min(len(text), pos + 4 * MAX_TOK)  # 4 chars/token is the widest estimate
-        while end > pos and n_tokens(text[pos:end]) > MAX_TOK:
-            end = max(pos + 1, end - 200)
-        if end < len(text):
-            space = max(text.rfind(" ", pos, end), text.rfind("\n", pos, end))
-            if space > pos + (end - pos) // 2:
-                end = space + 1
-        piece = text[pos:end]
-        # clamp to the unit's own span: a csv record index is not a line number
-        newlines = min(piece.count("\n"), unit.line_end - line)
-        yield Unit(unit.heading_path, line, line + newlines, piece.strip())
-        line += newlines
-        pos = end
+    newlines = _newlines(unit.text)
+    step = MAX_TOK - OVERLAP_TOK
+    for start in range(0, len(spans), step):
+        end = min(start + MAX_TOK, len(spans))
+        piece = _slice(unit, spans[start][0], spans[end - 1][1], newlines)
+        # Re-tokenizing a sliced substring can differ at its boundaries (a
+        # stripped leading space may split differently), so trim until it fits.
+        while n_tokens(piece.text, tokenizer) > MAX_TOK:
+            sub = tokenizer.spans(piece.text)
+            piece = _slice(piece, 0, sub[MAX_TOK - 1][1])
+        yield piece
+        if end == len(spans):
+            break
 
 
-def chunks(units: list[Unit]) -> list[Chunk]:
-    """Pack units into 512-800 token chunks, flushing at headings once full."""
+def _tail(group: list[Unit], tokenizer: ChunkTokenizer) -> list[Unit]:
+    """The units to repeat at the start of the next chunk: about OVERLAP_TOK.
+
+    Whole trailing units are used while they fit. A final unit larger than the
+    window contributes its last OVERLAP_TOK tokens, so a paragraph boundary
+    still gets the stated overlap.
+    """
+    tail: list[Unit] = []
+    for unit in reversed(group):
+        spans = tokenizer.spans(unit.text)
+        if tail:
+            if n_tokens("\n\n".join(u.text for u in [unit, *tail]), tokenizer) > OVERLAP_TOK:
+                break
+            tail.insert(0, unit)
+            continue
+        if len(spans) <= OVERLAP_TOK:
+            tail.insert(0, unit)
+            continue
+        tail = [_slice(unit, spans[-OVERLAP_TOK][0], spans[-1][1])]
+        break
+    return tail
+
+
+def _size(group: list[Unit], tokenizer: ChunkTokenizer) -> int:
+    return n_tokens("\n\n".join(u.text for u in group), tokenizer)
+
+
+def chunks(units: list[Unit], tokenizer: ChunkTokenizer) -> list[Chunk]:
+    """Pack units into 512-800 real-token chunks, flushing at headings once full.
+
+    Every flush starts the next chunk with the previous chunk's trailing
+    OVERLAP_TOK tokens. ``overlap_n`` marks those units so the heading rule and
+    MIN_TOK measure only the chunk's own new content.
+    """
     groups: list[list[Unit]] = []
     group: list[Unit] = []
-    size = 0
-    for unit in [piece for unit in units for piece in _fit(unit)]:
+    overlap_n = 0
+    for unit in (piece for original in units for piece in _fit(original, tokenizer)):
         if not any(c.isalnum() for c in unit.text):  # "---" rules, page separators
             continue
-        n = n_tokens(unit.text) + 1  # +1 for the "\n\n" join and per-unit rounding
-        overflow = size + n > MAX_TOK
-        if group and (overflow or (size >= MIN_TOK and unit.heading_path != group[0].heading_path)):
-            groups.append(group)
-            # The next unit may split a fact; when the split is for size, start
-            # the new chunk with the tail of the old one (about 10% overlap).
-            tail = group[-1]
-            tail = tail if overflow and n_tokens(tail.text) + n <= MAX_TOK else None
-            tail = tail if tail and n_tokens(tail.text) <= OVERLAP_TOK else None
-            group = [tail] if tail else []
-            size = n_tokens(tail.text) if tail else 0
-        group.append(unit)
-        size += n
+        if not group:
+            group, overlap_n = [unit], 0
+            continue
+        own = group[overlap_n:]
+        heading_break = (_size(own, tokenizer) >= MIN_TOK
+                         and unit.heading_path != own[-1].heading_path)
+        if not heading_break and _size(group + [unit], tokenizer) <= MAX_TOK:
+            group.append(unit)
+            continue
+        groups.append(group)
+        tail = _tail(group, tokenizer)
+        while tail and _size(tail + [unit], tokenizer) > MAX_TOK:
+            tail.pop(0)
+        group, overlap_n = tail + [unit], len(tail)
     if group:
         groups.append(group)
 
     return [
-        Chunk(max(g, key=lambda u: n_tokens(u.text)).heading_path,
+        Chunk(max(g, key=lambda u: n_tokens(u.text, tokenizer)).heading_path,
               g[0].line_start, g[-1].line_end, "\n\n".join(u.text for u in g))
-        for g in _fold_strays(groups)
+        for g in _fold_strays(groups, tokenizer)
     ]
 
 
-def _fold_strays(groups: list[list[Unit]]) -> list[list[Unit]]:
+def _fold_strays(groups: list[list[Unit]], tokenizer: ChunkTokenizer
+                 ) -> list[list[Unit]]:
     """Fold footer-sized chunks into a neighbour so page numbers get no chunk of their own."""
-    def size(group: list[Unit]) -> int:
-        return sum(n_tokens(u.text) + 1 for u in group)
-
     out: list[list[Unit]] = []
     for i, group in enumerate(groups):
-        if size(group) < STRAY_TOK:
-            if i + 1 < len(groups) and size(group) + size(groups[i + 1]) <= MAX_TOK:
+        if _size(group, tokenizer) < STRAY_TOK:
+            if i + 1 < len(groups) and _size(group + groups[i + 1], tokenizer) <= MAX_TOK:
                 groups[i + 1] = group + groups[i + 1]
                 continue
-            if out and size(out[-1]) + size(group) <= MAX_TOK:
+            if out and _size(out[-1] + group, tokenizer) <= MAX_TOK:
                 out[-1].extend(group)
                 continue
         out.append(group)
@@ -312,19 +366,63 @@ def _write_vectors(con: sqlite3.Connection, embedder: Embedder,
          for (chunk_id, _, _), vector in zip(pending, vectors)])
 
 
+def _embedder_id(embedder: Embedder | None) -> str:
+    if embedder is None:
+        return "fts-only"
+    return getattr(embedder, "id", type(embedder).__name__)
+
+
+def build_key(root: Path, tokenizer: ChunkTokenizer,
+              embedder: Embedder | None) -> str:
+    """Hash everything that can change the stored chunks or vectors.
+
+    The key covers the corpus bytes, the chunker version and parameters, the
+    tokenizer file (its ``id`` includes a hash), the embedder id and the dims.
+    A rebuild with the same key must reproduce the same chunks and vectors;
+    record it with the run so a later index can be traced back.
+    """
+    facts = {
+        "chunker_version": CHUNKER_VERSION,
+        "min_tok": MIN_TOK,
+        "max_tok": MAX_TOK,
+        "overlap_tok": OVERLAP_TOK,
+        "stray_tok": STRAY_TOK,
+        "embed_max_tokens": EMBED_MAX_TOKENS,
+        "tokenizer": tokenizer.id,
+        "embedder": _embedder_id(embedder),
+        "dims": DIMS,
+    }
+    digest = hashlib.sha256(json.dumps(facts, sort_keys=True).encode())
+    for path in sorted(p for p in root.rglob("*")
+                       if p.is_file() and p.suffix.lower() in SUFFIXES):
+        digest.update(f"{path.relative_to(root).as_posix()}\0".encode())
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+    return digest.hexdigest()
+
+
 def build_domain(domain: str, docs_dir: Path = DOCS_DIR,
                  index_dir: Path = INDEX_DIR,
-                 embedder: Embedder | None = None
-                 ) -> tuple[dict[str, int], int, Path]:
-    """(re)build one domain's index from scratch; return (file counts, chunks, db).
+                 embedder: Embedder | None = None,
+                 tokenizer: ChunkTokenizer | None = None
+                 ) -> tuple[dict[str, int], int, Path, str]:
+    """(re)build one domain's index from scratch; return (counts, chunks, db, key).
 
     With ``embedder``, also write 256d document vectors to the ``chunk_vectors``
     sqlite-vec table. The vector batch is finite-checked before insertion; a
     NaN or Inf aborts the build and leaves the previous database untouched.
+
+    ``tokenizer`` defaults to the embedder's own tokenizer, so chunk sizes are
+    real model tokens, not the old 4-chars estimate. Every chunk must fit
+    ``EMBED_MAX_TOKENS`` (including the document prefix); a violation aborts
+    the build instead of writing a tail the model cannot see.
     """
     root = Path(docs_dir) / domain
     if not root.is_dir():
         raise SystemExit(f"no domain directory: {root}")
+    tokenizer = tokenizer or EmbeddingGemmaTokenizer()
+    key = build_key(root, tokenizer, embedder)
 
     db_path = Path(index_dir) / f"{_slug(domain)}.sqlite"
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -340,6 +438,12 @@ def build_domain(domain: str, docs_dir: Path = DOCS_DIR,
     con = sqlite3.connect(tmp_path)
     try:
         con.executescript(SCHEMA)
+        con.executemany(
+            "INSERT INTO meta (key, value) VALUES (?, ?)",
+            [("build_key", key), ("chunker_version", str(CHUNKER_VERSION)),
+             ("tokenizer", tokenizer.id), ("embedder", _embedder_id(embedder)),
+             ("max_tok", str(MAX_TOK)), ("overlap_tok", str(OVERLAP_TOK)),
+             ("embed_max_tokens", str(EMBED_MAX_TOKENS)), ("dims", str(DIMS))])
         if embedder is not None:
             load_vec(con)
             con.executescript(VECTOR_SCHEMA)
@@ -349,7 +453,13 @@ def build_domain(domain: str, docs_dir: Path = DOCS_DIR,
                 continue
             doc_path = f"documents/{domain}/{path.relative_to(root).as_posix()}"
             rows = []
-            for chunk in chunks(list(_units(path))):
+            for chunk in chunks(list(_units(path)), tokenizer):
+                size = n_tokens(document_text(chunk.heading_path, chunk.text),
+                                tokenizer)
+                if size > EMBED_MAX_TOKENS:
+                    raise ValueError(
+                        f"{doc_path}:{chunk.line_start}: chunk is {size} tokens, "
+                        f"embedder window is {EMBED_MAX_TOKENS}")
                 rows.append((next_id, domain, doc_path, chunk.line_start,
                              chunk.line_end, chunk.heading_path, chunk.text,
                              cjk_split(chunk.text)))
@@ -379,7 +489,7 @@ def build_domain(domain: str, docs_dir: Path = DOCS_DIR,
     finally:
         con.close()
     tmp_path.replace(db_path)
-    return counts, total, db_path
+    return counts, total, db_path, key
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -409,11 +519,12 @@ def main(argv: list[str] | None = None) -> None:
     total_chunks = 0
     for domain in domains:
         started = time.perf_counter()
-        counts, n_chunks, db_path = build_domain(
+        counts, n_chunks, db_path, key = build_domain(
             domain, args.docs_dir, args.index_dir, embedder)
         elapsed = time.perf_counter() - started
         print(f"{domain}: {counts['md']} md + {counts['xlsx']} xlsx + {counts['csv']} csv"
-              f" -> {n_chunks} chunks in {elapsed:.1f}s -> {db_path}", flush=True)
+              f" -> {n_chunks} chunks in {elapsed:.1f}s -> {db_path}"
+              f" (build key {key})", flush=True)
         for kind in totals:
             totals[kind] += counts[kind]
         total_chunks += n_chunks
