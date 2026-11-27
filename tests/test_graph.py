@@ -51,6 +51,7 @@ def test_answer_tool_terminates():
     client = scripted(call("answer", {"value": "10.37 pp"}))
     state = graph.run("what is the margin?", client, CTX)
     assert state["answer"] == "10.37 pp"
+    assert state["answered"] is True
     assert state["turns"] == 1
     assert state["messages"][-1]["role"] == "tool"
 
@@ -62,7 +63,7 @@ def test_stops_at_max_turns(monkeypatch):
     state = graph.run("never answered", client, CTX)
     assert state["turns"] == 3
     assert len(client.calls) == 3
-    assert state["answer"] == "UNKNOWN"
+    assert state["answered"] is False
     # the last call still gets its result, so the trace has no dangling call
     assert [m["role"] for m in state["messages"]][-2:] == ["assistant", "tool"]
 
@@ -158,7 +159,9 @@ def test_answer_on_the_last_allowed_turn_is_captured(monkeypatch):
 
 def test_content_reply_without_tools_ends_the_episode():
     state = graph.run("q", scripted({"role": "assistant", "content": " 42 "}), CTX)
-    assert state["answer"] == "42"
+    # Assistant text is evidence, not a submission.
+    assert state["answered"] is False
+    assert "answer" not in state
 
 
 def test_empty_turn_is_nudged_then_recovers():
@@ -185,7 +188,7 @@ def test_empty_turns_stop_after_the_retry_bound(monkeypatch):
     monkeypatch.setattr(policy, "EMPTY_TURN_RETRIES", 2)
     client = scripted(*[{"role": "assistant", "content": None} for _ in range(5)])
     state = graph.run("q", client, CTX)
-    assert state["answer"] == "UNKNOWN"
+    assert state["answered"] is False
     assert state["turns"] == 3
     assert len(client.calls) == 3
 
@@ -195,7 +198,7 @@ def test_empty_turn_at_the_turn_cap_does_not_retry(monkeypatch):
     monkeypatch.setattr(policy, "FINAL_TURNS", 0)
     client = scripted({"role": "assistant", "content": None})
     state = graph.run("q", client, CTX)
-    assert state["answer"] == "UNKNOWN"
+    assert state["answered"] is False
     assert state["turns"] == 1
     assert len(client.calls) == 1
 
@@ -283,7 +286,7 @@ def test_repeated_calls_stay_bounded_by_max_turns(monkeypatch):
 
     assert state["turns"] == 3
     assert len(client.calls) == 3
-    assert state["answer"] == "UNKNOWN"
+    assert state["answered"] is False
 
 
 def test_final_phase_keeps_the_tool_list_and_restricts_the_choice(monkeypatch):
@@ -356,10 +359,10 @@ def test_final_phase_appends_the_nudge_once(monkeypatch):
     assert client.calls[2][-1] == {"role": "user",
                                    "content": policy.FINAL_ANSWER_NUDGE}
     assert state["turns"] == 3
-    assert state["answer"] == "UNKNOWN"
+    assert state["answered"] is False
 
 
-def test_final_phase_content_reply_is_the_text_fallback(monkeypatch):
+def test_final_phase_content_reply_is_not_an_answer(monkeypatch):
     monkeypatch.setattr(policy, "MAX_TURNS", 2)
     monkeypatch.setattr(policy, "FINAL_TURNS", 2)
     client = scripted({"role": "assistant", "content": " 42 "})
@@ -368,10 +371,11 @@ def test_final_phase_content_reply_is_the_text_fallback(monkeypatch):
     assert client.specs[0] == tools.SPECS
     assert client.forces[0] == "required"
     assert state["turns"] == 1
-    assert state["answer"] == "42"
+    assert state["answered"] is False
+    assert "answer" not in state
 
 
-def test_final_answer_nudge_forces_the_answer_and_keeps_the_text_fallback(monkeypatch):
+def test_final_answer_nudge_still_requires_the_answer_tool(monkeypatch):
     monkeypatch.setattr(policy, "MAX_TURNS", 1)
     monkeypatch.setattr(policy, "FINAL_TURNS", 1)
     client = scripted({"role": "assistant", "content": " 42 "})
@@ -383,7 +387,8 @@ def test_final_answer_nudge_forces_the_answer_and_keeps_the_text_fallback(monkey
                                    "content": policy.FINAL_ANSWER_NUDGE}
     assert "Only the answer tool" in policy.FINAL_ANSWER_NUDGE
     assert state["turns"] == 1
-    assert state["answer"] == "42"
+    assert state["answered"] is False
+    assert "answer" not in state
 
 
 def test_cut_point_keeps_tool_results_with_their_call():

@@ -60,18 +60,20 @@ def test_frozen_split_is_stratified_and_disjoint():
 def test_score_folds_exact_match_tokens_and_missing(tmp_path, corpus):
     runs = tmp_path / "runs"
     job = runs / "jobs" / "base"
-    for trial, answer, tokens in ((0, "10.37 pp\n", 123), (1, None, None)):
+    for trial, answer, tokens, answered in (
+            (0, "10.37 pp\n", 123, True), (1, None, None, False)):
         out = job / f"s{trial}" / "Finance & Economics__q_0001"
         out.mkdir(parents=True)
         (out / "trajectory.json").write_text(json.dumps(
-            {"status": "ok", "usage": {"total_tokens": tokens or 0}}))
+            {"status": "ok", "answered": answered,
+             "usage": {"total_tokens": tokens or 0}}))
         if answer is not None:
             (out / "answer.txt").write_text(answer)
     out = job / "s0" / "Finance & Economics__q_0002"
     out.mkdir(parents=True)
     (out / "answer.txt").write_text("wrong\n")
     (out / "trajectory.json").write_text(json.dumps(
-        {"status": "ok", "usage": {"total_tokens": 7}}))
+        {"status": "ok", "answered": True, "usage": {"total_tokens": 7}}))
 
     ids = ["Finance & Economics/q_0001", "Finance & Economics/q_0002"]
     per, extra = DOMAIN.score(runs, "base", ids, 2)
@@ -83,8 +85,62 @@ def test_score_folds_exact_match_tokens_and_missing(tmp_path, corpus):
     assert extra["n_trials"] == 4
     assert extra["exact_rate"] == 0.25
     assert extra["parseable_rate"] == 0.5
+    assert extra["answered"] == 2 and extra["answered_rate"] == 0.5
     assert extra["missing"] == 2 and extra["missing_rate"] == 0.5
     assert extra["guard_violations"] == []
+
+
+def test_answered_field_wins_over_the_answer_file():
+    assert ADAPTER._answered({"status": "ok", "answered": True}, "") is True
+    assert ADAPTER._answered({"status": "ok", "answered": False}, "10") is False
+    assert ADAPTER._answered({"status": "error", "answered": False}, "10") is False
+    # Legacy trials: a non-UNKNOWN answer is a completion; UNKNOWN is not.
+    assert ADAPTER._answered({"status": "ok"}, "10.37 pp") is True
+    assert ADAPTER._answered({"status": "ok"}, "UNKNOWN") is False
+    assert ADAPTER._answered({"status": "error"}, "10.37 pp") is False
+    assert ADAPTER._answered({"status": "ok"}, None) is False
+
+
+def test_run_retries_only_unanswered_trials(tmp_path, corpus, monkeypatch):
+    root = tmp_path / "root"
+    (root / "domains" / "agora" / "harness").mkdir(parents=True)
+    data = tmp_path / "data"
+    (data / "documents" / "Finance & Economics").mkdir(parents=True)
+    index = tmp_path / "index"
+    index.mkdir()
+    (index / "finance-economics.sqlite").write_bytes(b"")
+    embedder = tmp_path / "embedder"
+    embedder.mkdir()
+
+    monkeypatch.setattr(ADAPTER, "DATA_DIR", data)
+    monkeypatch.setattr(ADAPTER, "INDEX_DIR", index)
+    monkeypatch.setattr(ADAPTER, "EMBEDDER_DIR", embedder)
+    monkeypatch.setattr(ADAPTER, "_require_image", lambda image: "sha256:x")
+
+    job = tmp_path / "runs" / "jobs" / "j"
+    answered = job / "s0" / "Finance & Economics__q_0001"
+    answered.mkdir(parents=True)
+    (answered / "trajectory.json").write_text(json.dumps(
+        {"status": "ok", "answered": True}), encoding="utf-8")
+    (answered / "answer.txt").write_text("10.37 pp\n", encoding="utf-8")
+    pending = job / "s1" / "Finance & Economics__q_0001"
+    pending.mkdir(parents=True)
+    (pending / "trajectory.json").write_text(json.dumps(
+        {"status": "ok", "answered": False,
+         "stop_reason": "max_turns"}), encoding="utf-8")
+
+    called = []
+
+    def episode(root, task_id, trial, *args):
+        called.append((task_id, trial))
+        return "ok"
+
+    monkeypatch.setattr(DOMAIN, "_episode", episode)
+
+    DOMAIN.run(root, tmp_path / "runs", "j",
+               ["Finance & Economics/q_0001"], 2)
+
+    assert called == [("Finance & Economics/q_0001", 1)]
 
 
 def test_guards_reject_network_violation_and_rate_drop():
@@ -146,6 +202,16 @@ def test_env_args_forward_the_policy_budget(monkeypatch):
     assert "AGORA_CONTEXT_WINDOW=262144" in args
     assert "AGORA_SUMMARY_REASONING_EFFORT=none" in args
     assert "AGORA_SUMMARY_MAX_TOKENS=8192" in args
+
+
+def test_env_args_forward_the_retry_policy(monkeypatch):
+    monkeypatch.setenv("AGORA_REQUEST_RETRIES", "2")
+    monkeypatch.setenv("AGORA_REQUEST_TIMEOUT_S", "120")
+    monkeypatch.setenv("AGORA_SEED", "7")
+    args = ADAPTER._env_args()
+    assert "AGORA_REQUEST_RETRIES=2" in args
+    assert "AGORA_REQUEST_TIMEOUT_S=120" in args
+    assert "AGORA_SEED=7" in args
 
 
 def test_env_args_omit_unset_policy_budget(monkeypatch):

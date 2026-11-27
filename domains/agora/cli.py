@@ -6,13 +6,16 @@ here.
 
     python3 domains/agora/cli.py --task "Finance & Economics/q_0001" --out runs/t
 
-Resume-safe: an existing ``answer.txt`` means the episode finished, so it is
-skipped and the exit code is 0. A failed episode writes a partial
-``trajectory.json``, leaves ``answer.txt`` absent (so the adapter retries it)
+Resume-safe: a trial whose ``trajectory.json`` says ``answered: true`` is
+skipped and the exit code is 0. A finished episode without an answer leaves
+``answer.txt`` absent, so a later run retries it. ``answer.txt`` is the
+completion marker: it exists only after the ``answer`` tool call. A provider
+failure writes ``"UNKNOWN"`` in the trajectory only, records ``infra_error``
 and exits non-zero.
 
 Env: ``AGORA_DATA``, ``AGORA_INDEX``, ``AGORA_EMBEDDER``, ``AGORA_DOMAIN``,
-``AGORA_MODEL``, ``OPENAI_BASE_URL``, ``OPENAI_API_KEY``.
+``AGORA_MODEL``, ``OPENAI_BASE_URL``, ``OPENAI_API_KEY``,
+``AGORA_REQUEST_RETRIES``, ``AGORA_REQUEST_TIMEOUT_S``, ``AGORA_SEED``.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import signal
 import sys
 import time
@@ -32,6 +36,31 @@ from harness import context, graph, policy, prompts, tools
 
 MODEL = os.environ.get("AGORA_MODEL", "Inkling-2-Mini")
 LIVE = os.environ.get("AGORA_LIVE") == "1"
+
+# Provider retry policy. Three retries means at most four attempts per turn.
+# The timeout is per request, not per episode; the adapter still caps the task.
+REQUEST_RETRIES = max(0, int(os.environ.get("AGORA_REQUEST_RETRIES", "3")))
+REQUEST_TIMEOUT_S = max(1.0, float(os.environ.get(
+    "AGORA_REQUEST_TIMEOUT_S", "600")))
+SEED = int(os.environ["AGORA_SEED"]) if os.environ.get("AGORA_SEED") else None
+RETRY_BASE_S = 2.0
+RETRY_MAX_S = 30.0
+_SLEEP = time.sleep
+
+
+def _retry_delay(attempt: int) -> float:
+    """Full-jitter exponential backoff for retry number ``attempt`` (0-based)."""
+    ceiling = min(RETRY_MAX_S, RETRY_BASE_S * (2 ** attempt))
+    return random.uniform(0.0, ceiling)
+
+
+def _transient(exc: Exception, openai) -> bool:
+    """A provider error that a retry can fix."""
+    if isinstance(exc, (openai.APITimeoutError, openai.APIConnectionError,
+                        openai.RateLimitError)):
+        return True
+    status = getattr(exc, "status_code", None)
+    return isinstance(status, int) and (status == 429 or 500 <= status < 600)
 
 
 def _clip(value, limit: int = 800) -> str:
@@ -169,8 +198,10 @@ class _Live:
         if kind == "run_error":
             return f"[live] RUN ERROR {f['error']}"
         if kind == "final":
-            return (f"[live] FINAL status={f['status']} turns={f['turns']} "
+            return (f"[live] FINAL status={f['status']} "
+                    f"answered={f.get('answered')} turns={f['turns']} "
                     f"tokens={(f.get('usage') or {}).get('total_tokens')} "
+                    f"retries={f.get('retries')} "
                     f"answer={_clip(f.get('answer'), 1200)} error={f.get('error')}")
         if kind == "skipped":
             return f"[live] SKIP task={f['task']} trial={f['trial']}"
@@ -178,16 +209,43 @@ class _Live:
 
 
 def _client():
-    """OpenAI-compatible chat client for the policy endpoint (vLLM or Ollama)."""
-    from openai import BadRequestError, OpenAI, UnprocessableEntityError
+    """OpenAI-compatible chat client for the policy endpoint (vLLM or Ollama).
+
+    A transient provider error (429, 5xx, timeout, dropped connection) is
+    retried with full-jitter exponential backoff. The SDK's own retries are
+    off, so ``stats["retries"]`` is the exact count for the trajectory.
+    """
+    import openai
+    from openai import (BadRequestError, OpenAI, UnprocessableEntityError)
 
     key = os.environ.get("OPENAI_API_KEY") or "dummy"
     endpoint = OpenAI(
         base_url=os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1"),
-        api_key=key)
+        api_key=key, max_retries=0)
     # Keep the policy key out of the environment inherited by the python tool.
     os.environ.pop("OPENAI_API_KEY", None)
     os.environ.pop("RRSI_API_KEY", None)
+
+    stats = {"attempts": 0, "retries": 0, "errors": []}
+    seed = SEED
+
+    def create(request: dict):
+        """One request; drop an optional key the endpoint rejects."""
+        nonlocal seed
+        while True:
+            try:
+                return endpoint.chat.completions.create(
+                    **request, timeout=REQUEST_TIMEOUT_S)
+            except (BadRequestError, UnprocessableEntityError) as exc:
+                dropped = "seed" if "seed" in request else (
+                    "tool_choice" if "tool_choice" in request else None)
+                if dropped is None:
+                    raise
+                del request[dropped]
+                if dropped == "seed":
+                    seed = None  # the endpoint does not support it
+                print(f"warning: endpoint rejected {dropped}: {exc}; "
+                      "retrying without it", file=sys.stderr)
 
     def call(messages: list[dict], specs: list[dict],
              force: str | None = None) -> dict:
@@ -201,15 +259,19 @@ def _client():
         elif force == "required":
             # Final-phase calls before the last: python or answer, not text.
             request["tool_choice"] = "required"
-        try:
-            reply = endpoint.chat.completions.create(**request)
-        except (BadRequestError, UnprocessableEntityError) as exc:
-            if "tool_choice" not in request:
-                raise
-            print(f"warning: endpoint rejected tool_choice: {exc}; "
-                  "retrying without it", file=sys.stderr)
-            del request["tool_choice"]
-            reply = endpoint.chat.completions.create(**request)
+        if seed is not None:
+            request["seed"] = seed
+        for attempt in range(REQUEST_RETRIES + 1):
+            stats["attempts"] += 1
+            try:
+                reply = create(request)
+                break
+            except Exception as exc:
+                stats["errors"].append(type(exc).__name__)
+                if attempt >= REQUEST_RETRIES or not _transient(exc, openai):
+                    raise
+                stats["retries"] += 1
+                _SLEEP(_retry_delay(attempt))
         choice = reply.choices[0].message
         # Only the OpenAI message fields: the reply is sent back on every turn.
         message = {"role": "assistant", "content": choice.content}
@@ -219,6 +281,7 @@ def _client():
             message["usage"] = reply.usage.model_dump()
         return message
 
+    call.stats = stats
     return call
 
 
@@ -235,7 +298,7 @@ def _summarizer():
 
     endpoint = OpenAI(
         base_url=os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1"),
-        api_key=os.environ.get("OPENAI_API_KEY") or "dummy")
+        api_key=os.environ.get("OPENAI_API_KEY") or "dummy", max_retries=0)
     effort = os.environ.get("AGORA_SUMMARY_REASONING_EFFORT")
 
     def summarize(request: str) -> dict:
@@ -248,14 +311,16 @@ def _summarizer():
             call["extra_body"] = {
                 "chat_template_kwargs": {"reasoning_effort": effort}}
         try:
-            reply = endpoint.chat.completions.create(**call)
+            reply = endpoint.chat.completions.create(
+                **call, timeout=REQUEST_TIMEOUT_S)
         except (BadRequestError, UnprocessableEntityError) as exc:
             if "extra_body" not in call:
                 raise
             print(f"warning: endpoint rejected chat_template_kwargs: {exc}; "
                   "retrying without it", file=sys.stderr)
             del call["extra_body"]
-            reply = endpoint.chat.completions.create(**call)
+            reply = endpoint.chat.completions.create(
+                **call, timeout=REQUEST_TIMEOUT_S)
         choice = reply.choices[0]
         # A checkpoint cut at the output cap omits its newest findings, so the
         # harness treats it as a failed summary and falls back.
@@ -321,6 +386,31 @@ def _write(path: Path, text: str) -> None:
     tmp.replace(path)
 
 
+def _previous_trajectory(out: Path) -> dict | None:
+    try:
+        return json.loads((out / "trajectory.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _already_answered(out: Path) -> bool:
+    """Whether a previous run of this trial submitted an answer.
+
+    The explicit ``answered`` field wins. A trial from before the field exists
+    only when its old completion marker is a non-UNKNOWN answer; ``UNKNOWN``
+    was the old provider-failure placeholder and must be retried.
+    """
+    trajectory = _previous_trajectory(out) or {}
+    if "answered" in trajectory:
+        return trajectory.get("answered") is True
+    try:
+        answer = (out / "answer.txt").read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    return (trajectory.get("status") == "ok" and bool(answer)
+            and answer.upper() != "UNKNOWN")
+
+
 def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
              ctx: tools.Context | None = None, summarize=None,
              notes=None, count=None) -> dict:
@@ -334,10 +424,11 @@ def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
             live.event(kind, **fields)
 
     answer_path = out / "answer.txt"
-    if answer_path.exists():
+    if _already_answered(out):
         log("skipped", task=task.id, trial=trial)
         return {"task": task.id, "trial": trial, "status": "skipped",
-                "turns": 0, "usage": {"total_tokens": 0}}
+                "answered": True, "stop_reason": "answer", "infra_error": None,
+                "retries": 0, "turns": 0, "usage": {"total_tokens": 0}}
     scratch = out / "scratch"
     scratch.mkdir(parents=True, exist_ok=True)
     previous_scratch = os.environ.get("AGORA_SCRATCH")
@@ -409,8 +500,8 @@ def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
     try:
         state = graph.run(task.query, model, ctx or _context(task),
                           summarize=summarize, notes=notes, count=count)
-        status, error = "ok", None
-        turns, answer = state["turns"], state["answer"]
+        status, error, infra_error = "ok", None, None
+        turns, answer = state["turns"], state.get("answer")
         compactions = state.get("compactions") or []
         drift = state.get("token_drift") or []
         # The summary call is part of the episode cost, but not a model turn.
@@ -424,7 +515,9 @@ def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
         _add_tool_results(history, seen, state["messages"])
     except BaseException as exc:  # Ctrl-C / SIGTERM must still leave a trace
         status, error = "error", f"{type(exc).__name__}: {exc}"
-        answer = "UNKNOWN"
+        # UNKNOWN is the provider-failure marker and never a completion.
+        answer = "UNKNOWN" if isinstance(exc, Exception) else None
+        infra_error = type(exc).__name__ if isinstance(exc, Exception) else None
         turns = sum(1 for m in history if m.get("role") == "assistant")
         # The graph state is not available, so sum the replies already seen.
         usage = {}
@@ -441,26 +534,55 @@ def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
             os.environ["AGORA_SCRATCH"] = previous_scratch
     wall_time = round(time.monotonic() - started, 3)
 
+    tool_calls = _tool_calls(history)
+    answered = (status == "ok" and answer is not None
+                and any(call["name"] == "answer" for call in tool_calls))
+    if not answered:
+        # No answer tool call means no submission, even if a candidate harness
+        # left assistant text in the state.
+        answer = None if status == "ok" else answer
+    last = history[-1] if history else {}
+    if answered:
+        stop_reason = "answer"
+    elif error is not None:
+        stop_reason = "error"
+    elif turns >= policy.MAX_TURNS:
+        stop_reason = "max_turns"
+    elif (last.get("role") == "assistant" and not last.get("tool_calls")
+          and not str(last.get("content") or "").strip()):
+        stop_reason = "empty_turn"
+    elif last.get("role") == "assistant" and last.get("content"):
+        stop_reason = "text_reply"
+    else:
+        stop_reason = "no_answer"
+    stats = getattr(client, "stats", None)
+    retries = int(stats.get("retries", 0)) if isinstance(stats, dict) else 0
+
     usage.setdefault("total_tokens", 0)
-    log("final", status=status, turns=turns, answer=answer, usage=usage,
-        error=error)
+    log("final", status=status, answered=answered, turns=turns, answer=answer,
+        usage=usage, retries=retries, error=error)
     trajectory = {
         "task": task.id,
         "domain": task.domain,
         "trial": trial,
         "model": MODEL,
         "status": status,
+        "answered": answered,
+        "answer": answer,
+        "stop_reason": stop_reason,
+        "infra_error": infra_error,
+        "retries": retries,
         "error": error,
         "turns": turns,
         "wall_time_s": wall_time,
         "usage": usage,
         "compactions": compactions,
         "token_drift": drift,
-        "tool_calls": _tool_calls(history),
+        "tool_calls": tool_calls,
         "messages": history,
     }
     _write(out / "trajectory.json", json.dumps(trajectory, ensure_ascii=False))
-    if status == "ok":
+    if answered and answer is not None:
         _write(answer_path, answer + "\n")
     if interrupted is not None:
         raise interrupted

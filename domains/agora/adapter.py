@@ -17,7 +17,7 @@ Layout of one evaluation::
 
     runs/agora/jobs/<job>/s<trial>/<domain>__<qid>/
         trajectory.json   written by cli.py
-        answer.txt        written only on a clean finish
+        answer.txt        written only after the answer tool call
 
 A missing trial is reward 0 with the full denominator, never a skipped slot.
 
@@ -164,6 +164,20 @@ def _read_answer(path: Path) -> str | None:
         return None
 
 
+def _answered(trajectory: dict | None, prediction: str | None) -> bool:
+    """Whether the trial submitted an answer, not merely finished.
+
+    The explicit ``answered`` field is authoritative. Trials from before the
+    field exists count only with a clean status and a non-UNKNOWN answer;
+    ``UNKNOWN`` was the old provider-failure placeholder.
+    """
+    trajectory = trajectory or {}
+    if "answered" in trajectory:
+        return trajectory.get("answered") is True
+    return (trajectory.get("status") == "ok" and prediction is not None
+            and prediction.strip().upper() != "UNKNOWN")
+
+
 def _log(path: Path, message: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with _LOG_LOCK:
@@ -256,7 +270,8 @@ def _env_args() -> list[str]:
     names = ("AGORA_MODEL", "OPENAI_BASE_URL", "OPENAI_API_KEY", "AGORA_LIVE",
              "AGORA_RERANK_URL", "AGORA_RERANK_MODEL", "AGORA_TEMPERATURE",
              "AGORA_CONTEXT_WINDOW", "AGORA_SUMMARY_MAX_TOKENS",
-             "AGORA_SUMMARY_REASONING_EFFORT")
+             "AGORA_SUMMARY_REASONING_EFFORT", "AGORA_REQUEST_RETRIES",
+             "AGORA_REQUEST_TIMEOUT_S", "AGORA_SEED")
     args: list[str] = []
     for name in names:
         value = os.environ.get(name)
@@ -347,14 +362,16 @@ class AgoraDomain(Domain):
             task_file = _stage_task(stage, task)
             for trial in range(k):
                 out = job_dir / f"s{trial}" / _name(task_id)
-                if (out / "answer.txt").exists():
+                if _answered(_read_json(out / "trajectory.json"),
+                             _read_answer(out / "answer.txt")):
                     continue
                 out.mkdir(parents=True, exist_ok=True)
                 episodes.append((task_id, trial, out, task, docs, index,
                                  task_file))
 
         if not episodes:
-            _log(log_path, f"{log_prefix}{job}: all {len(ids) * k} trials exist")
+            _log(log_path, f"{log_prefix}{job}: all {len(ids) * k} trials "
+                           f"answered")
             return
 
         workers = max(1, min(MAX_CONCURRENT, len(episodes)))
@@ -430,7 +447,10 @@ class AgoraDomain(Domain):
                 process.wait(timeout=60)
                 code = -9
         if code == 0:
-            return "ok"
+            trajectory = _read_json(Path(out) / "trajectory.json") or {}
+            if trajectory.get("answered") is True:
+                return "ok"
+            return f"unanswered ({trajectory.get('stop_reason') or 'no record'})"
         return f"exit {code} (see {log_file.name})"
 
     def score(self, runs_dir, job, ids, k):
@@ -440,7 +460,7 @@ class AgoraDomain(Domain):
         guard = _read_json(guard_file) or {}
         violations = guard.get("violations") or []
         per: dict[str, TaskResult] = {}
-        exact = parseable = answered = missing_total = trials = 0
+        exact = parseable = answered_total = missing_total = trials = 0
 
         for task_id in ids:
             rewards, tokens = [], []
@@ -451,10 +471,12 @@ class AgoraDomain(Domain):
                 trajectory = _read_json(out / "trajectory.json")
                 prediction = _read_answer(out / "answer.txt")
                 status = (trajectory or {}).get("status")
-                clean = prediction is not None and status == "ok"
+                answered = _answered(trajectory, prediction)
+                clean = answered and prediction is not None and status == "ok"
                 reward = (agora_score.score(gold, prediction) if clean else 0.0)
-                is_parseable = bool(clean and prediction
-                                    and prediction.strip().upper() != "UNKNOWN")
+                is_parseable = bool(
+                    clean and prediction
+                    and prediction.strip().upper() != "UNKNOWN")
                 usage = (trajectory or {}).get("usage") or {}
                 token_count = usage.get("total_tokens")
                 tokens.append(token_count if isinstance(token_count, (int, float))
@@ -463,8 +485,8 @@ class AgoraDomain(Domain):
                 trials += 1
                 exact += reward
                 parseable += int(is_parseable)
-                answered += int(prediction is not None)
-                if prediction is None:
+                answered_total += int(answered)
+                if not answered:
                     missing += 1
                     missing_total += 1
             per[task_id] = TaskResult(rewards=rewards, tokens=tokens,
@@ -477,8 +499,8 @@ class AgoraDomain(Domain):
             "exact_rate": exact / denominator,
             "parseable": parseable,
             "parseable_rate": parseable / denominator,
-            "answered": answered,
-            "answered_rate": answered / denominator,
+            "answered": answered_total,
+            "answered_rate": answered_total / denominator,
             "missing": missing_total,
             "missing_rate": missing_total / denominator,
             "guard_violations": list(violations),
@@ -507,6 +529,7 @@ class AgoraDomain(Domain):
             return None
         prediction = _read_answer(out / "answer.txt")
         gold = _gold(task_id)
+        answered = _answered(trajectory, prediction)
         return {
             "task_id": task_id,
             "domain": task_id.rpartition("/")[0],
@@ -514,9 +537,10 @@ class AgoraDomain(Domain):
             "trajectory": trajectory,
             "answer": prediction,
             "gold": gold,
+            "answered": answered,
             "match": (agora_score.score(gold, prediction)
-                      if prediction is not None else 0.0),
-            "missing": prediction is None,
+                      if answered and prediction is not None else 0.0),
+            "missing": not answered,
         }
 
     def render_trace(self, rec, detail=False):
@@ -530,7 +554,10 @@ class AgoraDomain(Domain):
         lines = [
             f"TASK: {rec.get('task_id')} | domain: {rec.get('domain')} | "
             f"trial: {rec.get('trial')}",
-            f"STATUS: {trajectory.get('status')} | turns: "
+            f"STATUS: {trajectory.get('status')} | answered: "
+            f"{trajectory.get('answered')} | stop: "
+            f"{trajectory.get('stop_reason')} | retries: "
+            f"{trajectory.get('retries')} | turns: "
             f"{trajectory.get('turns')} | total_tokens: "
             f"{usage.get('total_tokens')} | error: {trajectory.get('error')}",
             "", "=== TRAJECTORY ===",
@@ -616,6 +643,10 @@ class AgoraDomain(Domain):
             return False, {"stage": "smoke_run",
                            "detail": f"status {trajectory.get('status')}: "
                                      f"{trajectory.get('error')}"}
+        if trajectory.get("answered") is not True:
+            return False, {"stage": "smoke_run",
+                           "detail": f"not answered: "
+                                     f"{trajectory.get('stop_reason')}"}
         if not (out / "answer.txt").exists():
             return False, {"stage": "smoke_run", "detail": "no answer.txt"}
         return True, {"stage": "smoke_run", "task": ids[0],

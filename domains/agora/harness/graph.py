@@ -42,6 +42,7 @@ class State(TypedDict, total=False):
     recent_calls: list[str]
     repeat_nudged: str | None
     answer: str
+    answered: bool
     usage: dict
     anchor: dict | None
     compactions: list[dict]
@@ -93,13 +94,6 @@ def _empty_reply(message: dict) -> bool:
     """A reply with no content and no tool call cannot advance the episode."""
     return (not message.get("tool_calls")
             and not str(message.get("content") or "").strip())
-
-
-def _last_text(messages: list[dict]) -> str:
-    for message in reversed(messages):
-        if message.get("role") == "assistant" and message.get("content"):
-            return message["content"].strip()
-    return ""
 
 
 def sum_usage(target: dict, usage: dict | None) -> dict:
@@ -379,7 +373,12 @@ def build(client=None, ctx: tools.Context | None = None, summarize=None,
 
 def run(task: str, client, ctx: tools.Context, summarize=None, notes=None,
         count=None) -> dict:
-    """One episode. Returns the final state plus a never-empty ``answer``."""
+    """One episode. ``answered`` is true only after the ``answer`` tool call.
+
+    Assistant text is evidence, not a submission. The old fallback wrote the
+    last assistant text (or ``"UNKNOWN"``) as the answer, so a turn-limit stop
+    looked like a completed trial.
+    """
     state = build(client, ctx, summarize, notes, count).invoke(
         {"messages": [{"role": "system", "content": prompts.SYSTEM},
                       {"role": "user", "content": task}],
@@ -387,5 +386,5 @@ def run(task: str, client, ctx: tools.Context, summarize=None, notes=None,
          "repeat_nudged": None, "anchor": None, "compactions": [],
          "summary_usage": {}, "token_drift": []},
         {"recursion_limit": 2 * policy.MAX_TURNS + 5})
-    state["answer"] = state.get("answer") or _last_text(state["messages"]) or "UNKNOWN"
+    state["answered"] = state.get("answer") is not None
     return state

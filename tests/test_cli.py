@@ -160,6 +160,8 @@ def test_token_counter_disables_after_one_failure(monkeypatch, capsys):
 
 
 def test_existing_answer_is_skipped(tmp_path):
+    (tmp_path / "trajectory.json").write_text(json.dumps(
+        {"status": "ok", "answered": True}))
     (tmp_path / "answer.txt").write_text("10.37 pp\n")
 
     def never(messages, specs):
@@ -167,6 +169,28 @@ def test_existing_answer_is_skipped(tmp_path):
 
     trajectory = cli.run_task(TASK, tmp_path, client=never, ctx=CTX)
     assert trajectory["status"] == "skipped"
+
+
+def test_legacy_real_answer_is_skipped(tmp_path):
+    (tmp_path / "trajectory.json").write_text(json.dumps({"status": "ok"}))
+    (tmp_path / "answer.txt").write_text("10.37 pp\n")
+
+    def never(messages, specs):
+        raise AssertionError("the model must not be called on a finished task")
+
+    trajectory = cli.run_task(TASK, tmp_path, client=never, ctx=CTX)
+    assert trajectory["status"] == "skipped"
+
+
+def test_legacy_unknown_answer_is_retried(tmp_path):
+    (tmp_path / "trajectory.json").write_text(json.dumps({"status": "ok"}))
+    (tmp_path / "answer.txt").write_text("UNKNOWN\n")
+    client = scripted(call("answer", {"value": "10.37 pp"}))
+
+    trajectory = cli.run_task(TASK, tmp_path, client=client, ctx=CTX)
+
+    assert trajectory["answered"] is True
+    assert trajectory["stop_reason"] == "answer"
     assert (tmp_path / "answer.txt").read_text() == "10.37 pp\n"
 
 
@@ -194,6 +218,10 @@ def test_failure_writes_partial_trajectory_and_exits_nonzero(tmp_path, monkeypat
     assert cli.main(["--task", TASK.id, "--out", str(out)]) == 1
     trajectory = json.loads((out / "trajectory.json").read_text())
     assert trajectory["status"] == "error"
+    assert trajectory["answered"] is False
+    assert trajectory["infra_error"] == "ConnectionError"
+    assert trajectory["stop_reason"] == "error"
+    assert trajectory["answer"] == "UNKNOWN"
     assert "endpoint down" in trajectory["error"]
     assert trajectory["turns"] == 1
     assert trajectory["usage"]["total_tokens"] == 4
@@ -290,8 +318,99 @@ def test_interrupt_still_writes_a_partial_trajectory(tmp_path):
         cli.run_task(TASK, tmp_path, client=interrupted, ctx=CTX)
     trajectory = json.loads((tmp_path / "trajectory.json").read_text())
     assert trajectory["status"] == "error"
+    assert trajectory["answered"] is False
+    assert trajectory["infra_error"] is None
     assert trajectory["error"].startswith("KeyboardInterrupt")
     assert not (tmp_path / "answer.txt").exists()
+
+
+def test_text_reply_is_not_an_answer(tmp_path):
+    client = scripted({"role": "assistant", "content": "the answer is 10.37 pp"})
+
+    trajectory = cli.run_task(TASK, tmp_path, client=client, ctx=CTX)
+
+    assert trajectory["status"] == "ok"
+    assert trajectory["answered"] is False
+    assert trajectory["stop_reason"] == "text_reply"
+    assert trajectory["answer"] is None
+    assert not (tmp_path / "answer.txt").exists()
+
+
+def test_empty_final_turn_is_not_an_answer(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli.policy, "EMPTY_TURN_RETRIES", 0)
+    client = scripted({"role": "assistant", "content": None})
+
+    trajectory = cli.run_task(TASK, tmp_path, client=client, ctx=CTX)
+
+    assert trajectory["answered"] is False
+    assert trajectory["stop_reason"] == "empty_turn"
+    assert not (tmp_path / "answer.txt").exists()
+
+
+def test_unanswered_episode_is_retried(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli.policy, "MAX_TURNS", 1)
+    monkeypatch.setattr(cli.policy, "FINAL_TURNS", 0)
+    first = scripted(call("teleport", {}))
+
+    trajectory = cli.run_task(TASK, tmp_path, client=first, ctx=CTX)
+
+    assert trajectory["status"] == "ok"
+    assert trajectory["answered"] is False
+    assert trajectory["stop_reason"] == "max_turns"
+    assert trajectory["answer"] is None
+    assert not (tmp_path / "answer.txt").exists()
+
+    second = scripted(call("answer", {"value": "10.37 pp"}))
+    again = cli.run_task(TASK, tmp_path, client=second, ctx=CTX)
+
+    assert again["answered"] is True
+    assert (tmp_path / "answer.txt").read_text() == "10.37 pp\n"
+
+
+def test_trajectory_records_the_retry_count(tmp_path):
+    client = scripted(call("answer", {"value": "10.37 pp"}))
+    client.stats = {"attempts": 2, "retries": 1, "errors": ["ServerError"]}
+
+    trajectory = cli.run_task(TASK, tmp_path, client=client, ctx=CTX)
+
+    assert trajectory["answered"] is True
+    assert trajectory["retries"] == 1
+
+
+def test_episode_completes_after_a_transient_500(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    class ServerError(Exception):
+        status_code = 500
+
+    calls = []
+
+    class Completions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise ServerError("upstream failed")
+            tool_call = SimpleNamespace(model_dump=lambda: {
+                "id": "c1", "type": "function",
+                "function": {"name": "answer",
+                             "arguments": json.dumps({"value": "10.37 pp"})}})
+            return SimpleNamespace(
+                choices=[SimpleNamespace(
+                    message=SimpleNamespace(content=None,
+                                            tool_calls=[tool_call]),
+                    finish_reason="tool_calls")],
+                usage=SimpleNamespace(model_dump=lambda: {"total_tokens": 1}))
+
+    _fake_endpoint(monkeypatch, Completions())
+    monkeypatch.setattr(cli, "_SLEEP", lambda _: None)
+    monkeypatch.setenv("OPENAI_API_KEY", "dummy")
+
+    trajectory = cli.run_task(TASK, tmp_path, client=cli._client(), ctx=CTX)
+
+    assert trajectory["answered"] is True
+    assert trajectory["retries"] == 1
+    assert trajectory["infra_error"] is None
+    assert (tmp_path / "answer.txt").read_text() == "10.37 pp\n"
 
 
 def _reply(content="10.37 pp", finish_reason="stop"):
@@ -369,6 +488,108 @@ def test_client_reports_a_rejected_tool_choice_and_retries_once(monkeypatch, cap
     assert "tool_choice" in requests[0]
     assert "tool_choice" not in requests[1]
     assert "rejected tool_choice" in capsys.readouterr().err
+
+
+def test_client_retries_a_transient_500_then_succeeds(monkeypatch):
+    class ServerError(Exception):
+        status_code = 500
+
+    requests = []
+
+    class Completions:
+        def create(self, **kwargs):
+            requests.append(kwargs)
+            if len(requests) == 1:
+                raise ServerError("upstream failed")
+            return _reply()
+
+    _fake_endpoint(monkeypatch, Completions())
+    monkeypatch.setattr(cli, "_SLEEP", lambda _: None)
+    monkeypatch.setenv("OPENAI_API_KEY", "dummy")
+
+    client = cli._client()
+    reply = client([{"role": "user", "content": "q"}], cli.tools.SPECS)
+
+    assert reply["content"] == "10.37 pp"
+    assert len(requests) == 2
+    assert requests[0]["timeout"] == cli.REQUEST_TIMEOUT_S
+    assert client.stats["retries"] == 1
+
+
+def test_client_retries_a_timeout_to_the_bound(monkeypatch):
+    import openai
+
+    class Timeout(Exception):
+        pass
+
+    calls = []
+
+    class Completions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            raise Timeout("no reply")
+
+    _fake_endpoint(monkeypatch, Completions())
+    monkeypatch.setattr(openai, "APITimeoutError", Timeout)
+    monkeypatch.setattr(cli, "_SLEEP", lambda _: None)
+    monkeypatch.setenv("OPENAI_API_KEY", "dummy")
+
+    client = cli._client()
+    with pytest.raises(Timeout):
+        client([{"role": "user", "content": "q"}], cli.tools.SPECS)
+
+    assert len(calls) == cli.REQUEST_RETRIES + 1
+    assert client.stats["retries"] == cli.REQUEST_RETRIES
+
+
+def test_client_does_not_retry_a_400(monkeypatch):
+    class BadRequest(Exception):
+        status_code = 400
+
+    calls = []
+
+    class Completions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            raise BadRequest("bad request")
+
+    openai = _fake_endpoint(monkeypatch, Completions())
+    monkeypatch.setattr(openai, "BadRequestError", BadRequest)
+    monkeypatch.setattr(openai, "UnprocessableEntityError", BadRequest)
+    monkeypatch.setenv("OPENAI_API_KEY", "dummy")
+
+    client = cli._client()
+    with pytest.raises(BadRequest):
+        client([{"role": "user", "content": "q"}], cli.tools.SPECS)
+
+    assert len(calls) == 1
+    assert client.stats["retries"] == 0
+
+
+def test_client_drops_a_rejected_seed(monkeypatch):
+    class Rejected(Exception):
+        pass
+
+    requests = []
+
+    class Completions:
+        def create(self, **kwargs):
+            requests.append(dict(kwargs))
+            if "seed" in kwargs:
+                raise Rejected("seed is not supported")
+            return _reply()
+
+    openai = _fake_endpoint(monkeypatch, Completions())
+    monkeypatch.setattr(openai, "BadRequestError", Rejected)
+    monkeypatch.setattr(openai, "UnprocessableEntityError", Rejected)
+    monkeypatch.setattr(cli, "SEED", 7)
+    monkeypatch.setenv("OPENAI_API_KEY", "dummy")
+
+    client = cli._client()
+    client([{"role": "user", "content": "q"}], cli.tools.SPECS)
+    client([{"role": "user", "content": "q"}], cli.tools.SPECS)
+
+    assert ["seed" in request for request in requests] == [True, False, False]
 
 
 def test_summarizer_has_no_tools_and_keeps_thinking_on(monkeypatch):

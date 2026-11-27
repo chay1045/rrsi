@@ -68,7 +68,9 @@ The interface contract stays unchanged:
 - `harness.tools.dispatch(name, args, ctx)` keeps its signature;
 - the tool names and argument schemas stay stable;
 - `harness.Context` keeps its fields;
-- `trajectory.json` keeps its schema and `answer.txt` keeps its meaning.
+- `trajectory.json` and `answer.txt` are written only by the frozen `cli.py`;
+  the harness must not write or reinterpret them. `answer.txt` is the
+  completion marker and exists only after the `answer` tool call.
 
 The harness runs unattended on every task in the set. One unhandled exception
 on the hot path can invalidate the whole candidate.
