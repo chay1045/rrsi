@@ -152,6 +152,13 @@ def test_env_args_omit_unset_policy_budget(monkeypatch):
     assert not any(arg.startswith("AGORA_CONTEXT_CHARS=") for arg in args)
 
 
+def test_task_timeout_default_and_override(monkeypatch):
+    monkeypatch.delenv("AGORA_TASK_TIMEOUT_S", raising=False)
+    assert ADAPTER._task_timeout() == 7200
+    monkeypatch.setenv("AGORA_TASK_TIMEOUT_S", "9000")
+    assert ADAPTER._task_timeout() == 9000
+
+
 def test_stage_task_redacts_gold_and_keeps_one_domain(tmp_path, corpus):
     task = ADAPTER.task_map()[("Finance & Economics", "q_0001")]
     task_file = ADAPTER._stage_task(tmp_path / "stage", task)

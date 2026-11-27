@@ -126,7 +126,7 @@ MAX_CONCURRENT = _max_concurrent()
 
 
 def _task_timeout() -> int:
-    """Per-episode cap: a local 400-turn run needs more than the 3600 s default."""
+    """Per-episode cap: the 96k-char budget needs more than 3600 s locally."""
     raw = os.environ.get("AGORA_TASK_TIMEOUT_S")
     if raw is None:
         return int(CFG["task_timeout_s"])

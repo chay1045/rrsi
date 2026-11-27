@@ -21,9 +21,9 @@ RERANK = True            # cross-encoder rescoring of the RRF top-50. Gate 2
                          # search, about 30 s per base14 episode. Requires
                          # scripts/serve_rerank.sh; set False for RRF only.
 MAX_TURNS = 150          # model calls per episode. The cloud 100-turn smoke took
-                         # 308 s, so 150 (~8 min) fits the 3600 s task timeout.
-                         # The local 100-turn H0 is recorded at 42cfea4; local
-                         # runs must lower this cap or expect timeouts.
+                         # 308 s, so 150 (~8 min) fits the 7200 s task timeout.
+                         # The local 100-turn H0 is recorded at 42cfea4; the
+                         # longer timeout leaves room for a 96k-char episode.
 FINAL_TURNS = 6          # last calls of the episode: five may still use python
                          # to compute the value; the last call offers only the
                          # answer tool and the client forces it.
