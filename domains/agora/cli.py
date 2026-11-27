@@ -171,15 +171,17 @@ def _summarizer():
                 "temperature": 0.0,
                 "max_tokens": policy.SUMMARY_MAX_TOKENS}
         if effort:
-            call["chat_template_kwargs"] = {"reasoning_effort": effort}
+            # vLLM extension; the OpenAI SDK sends it under extra_body.
+            call["extra_body"] = {
+                "chat_template_kwargs": {"reasoning_effort": effort}}
         try:
             reply = endpoint.chat.completions.create(**call)
         except (BadRequestError, UnprocessableEntityError) as exc:
-            if "chat_template_kwargs" not in call:
+            if "extra_body" not in call:
                 raise
             print(f"warning: endpoint rejected chat_template_kwargs: {exc}; "
                   "retrying without it", file=sys.stderr)
-            del call["chat_template_kwargs"]
+            del call["extra_body"]
             reply = endpoint.chat.completions.create(**call)
         choice = reply.choices[0]
         # A checkpoint cut at the output cap omits its newest findings, so the

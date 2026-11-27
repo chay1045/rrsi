@@ -289,7 +289,7 @@ def test_summarizer_has_no_tools_and_keeps_thinking_on(monkeypatch):
     assert "tools" not in requests[0]
     assert requests[0]["temperature"] == 0.0
     assert requests[0]["max_tokens"] == cli.policy.SUMMARY_MAX_TOKENS
-    assert "chat_template_kwargs" not in requests[0]
+    assert "extra_body" not in requests[0]
 
 
 def test_summarizer_flags_a_truncated_checkpoint(monkeypatch):
@@ -317,4 +317,5 @@ def test_summarizer_passes_the_effort_override(monkeypatch):
 
     cli._summarizer()("compress")
 
-    assert requests[0]["chat_template_kwargs"] == {"reasoning_effort": "none"}
+    assert requests[0]["extra_body"] == {
+        "chat_template_kwargs": {"reasoning_effort": "none"}}
