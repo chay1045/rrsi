@@ -2,7 +2,7 @@
 
     python3 domains/agora/index/build.py --domain "Finance & Economics" --embed
 
-The default build writes the FTS5 table only. ``--embed`` also writes 256d
+The default build writes the FTS5 table only. ``--embed`` also writes 768d
 EmbeddingGemma 2 vectors to the sqlite-vec ``chunk_vectors`` table, which the
 hybrid query path needs.
 
@@ -84,7 +84,7 @@ CREATE VIRTUAL TABLE chunk_vectors USING vec0(
 """
 
 VECTOR_BATCH = 128  # chunks per encode call; keeps peak memory flat
-PROGRESS_CHUNKS = 10_000  # one line every N chunks so a long embed is observable
+PROGRESS_SECONDS = 30.0  # one progress line per interval so a long embed is observable
 
 
 @dataclass(frozen=True)
@@ -417,6 +417,22 @@ def build_key(root: Path, tokenizer: ChunkTokenizer,
     return digest.hexdigest()
 
 
+def _log_progress(domain: str, done_files: int, n_files: int,
+                  done_bytes: int, total_bytes: int, chunks: int,
+                  started: float, embedding: bool,
+                  last_path: Path | None = None) -> None:
+    """One progress line: files, bytes, chunks, rate and a byte-fraction ETA."""
+    elapsed = time.perf_counter() - started
+    fraction = done_bytes / total_bytes if total_bytes else 1.0
+    rate = chunks / elapsed if elapsed else 0.0
+    eta = elapsed * (1 - fraction) / fraction if 0 < fraction < 1 else 0.0
+    current = f" last {last_path.name[:60]}" if last_path is not None else ""
+    print(f"{domain}: {'embed' if embedding else 'fts'} "
+          f"{done_files}/{n_files} files, {fraction * 100:5.1f}% bytes, "
+          f"{chunks} chunks, {rate:.1f} chunks/s, {elapsed / 60:.1f} min, "
+          f"ETA {eta / 60:.1f} min{current}", flush=True)
+
+
 def build_domain(domain: str, docs_dir: Path = DOCS_DIR,
                  index_dir: Path = INDEX_DIR,
                  embedder: Embedder | None = None,
@@ -424,7 +440,7 @@ def build_domain(domain: str, docs_dir: Path = DOCS_DIR,
                  ) -> tuple[dict[str, int], int, Path, str]:
     """(re)build one domain's index from scratch; return (counts, chunks, db, key).
 
-    With ``embedder``, also write 256d document vectors to the ``chunk_vectors``
+    With ``embedder``, also write 768d document vectors to the ``chunk_vectors``
     sqlite-vec table. The vector batch is finite-checked before insertion; a
     NaN or Inf aborts the build and leaves the previous database untouched.
 
@@ -444,12 +460,21 @@ def build_domain(domain: str, docs_dir: Path = DOCS_DIR,
     tmp_path = db_path.with_name(db_path.name + ".tmp")
     tmp_path.unlink(missing_ok=True)  # a killed build must not look like a good db
 
+    files = sorted(p for p in root.rglob("*")
+                   if p.is_file() and p.suffix.lower() in SUFFIXES)
+    total_bytes = sum(path.stat().st_size for path in files)
+
     counts = {"md": 0, "xlsx": 0, "csv": 0}
     total = 0
     next_id = 1
-    reported = 0
-    started_domain = time.perf_counter()
+    done_files = 0
+    done_bytes = 0
+    last_report = time.perf_counter()
+    started_domain = last_report
     pending: list[tuple[int, str, str]] = []
+    print(f"{domain}: {len(files)} files, {total_bytes / 1e6:.1f} MB, "
+          f"chunker v{CHUNKER_VERSION}, tokenizer {tokenizer.id}, {DIMS}d",
+          flush=True)
     con = sqlite3.connect(tmp_path)
     try:
         con.executescript(SCHEMA)
@@ -462,10 +487,8 @@ def build_domain(domain: str, docs_dir: Path = DOCS_DIR,
         if embedder is not None:
             load_vec(con)
             con.executescript(VECTOR_SCHEMA)
-        for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        for path in files:
             kind = SUFFIXES.get(path.suffix.lower())
-            if kind is None:
-                continue
             doc_path = f"documents/{domain}/{path.relative_to(root).as_posix()}"
             rows = []
             for chunk in chunks(list(_units(path)), tokenizer):
@@ -490,10 +513,14 @@ def build_domain(domain: str, docs_dir: Path = DOCS_DIR,
             if embedder is not None and len(pending) >= VECTOR_BATCH:
                 _write_vectors(con, embedder, pending)
                 pending.clear()
-            if embedder is not None and total // PROGRESS_CHUNKS > reported:
-                reported = total // PROGRESS_CHUNKS
-                print(f"{domain}: {total} chunks in "
-                      f"{time.perf_counter() - started_domain:.0f}s", flush=True)
+            done_files += 1
+            done_bytes += path.stat().st_size
+            now = time.perf_counter()
+            if now - last_report >= PROGRESS_SECONDS:
+                _log_progress(domain, done_files, len(files), done_bytes,
+                              total_bytes, total, started_domain,
+                              embedder is not None, path)
+                last_report = now
         if pending:
             _write_vectors(con, embedder, pending)
         con.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')")
@@ -504,6 +531,9 @@ def build_domain(domain: str, docs_dir: Path = DOCS_DIR,
     finally:
         con.close()
     tmp_path.replace(db_path)
+    _log_progress(domain, done_files, len(files), done_bytes, total_bytes,
+                  total, started_domain, embedder is not None,
+                  files[-1] if files else None)
     return counts, total, db_path, key
 
 
@@ -514,7 +544,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--docs-dir", type=Path, default=DOCS_DIR)
     ap.add_argument("--index-dir", type=Path, default=INDEX_DIR)
     ap.add_argument("--embed", action="store_true",
-                    help="also write 256d EmbeddingGemma 2 vectors (sqlite-vec)")
+                    help="also write 768d EmbeddingGemma 2 vectors (sqlite-vec)")
     args = ap.parse_args(argv)
 
     if not args.docs_dir.is_dir():

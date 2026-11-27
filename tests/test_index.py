@@ -38,7 +38,7 @@ TOKENIZER = (Path(os.environ.get("AGORA_EMBEDDER") or
 
 
 class FakeEmbedder:
-    """Deterministic 256d vectors: dim 0 means 'zebra', dim 1 means 'alpha'."""
+    """Deterministic 768d vectors: dim 0 means 'zebra', dim 1 means 'alpha'."""
 
     dims = build.DIMS
 

@@ -6,7 +6,7 @@ uses. Not evolvable, like the rest of index/: rewording the query would move
 the gate without moving the agent.
 
 The BM25 side needs no model. The dense side embeds the query with
-EmbeddingGemma 2 (lazy import) and reads the 256d ``chunk_vectors`` table.
+EmbeddingGemma 2 (lazy import) and reads the 768d ``chunk_vectors`` table.
 ``k`` is a parameter because the tool picks its own depth; Gate 2 uses 10.
 
 An optional cross-encoder reranker takes the RRF top-50 down to ``k``. The

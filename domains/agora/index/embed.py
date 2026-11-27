@@ -11,8 +11,8 @@ PLAN.md §5.1 is mandatory here:
 * bf16 on CUDA when the device supports it, fp32 otherwise -- never fp16;
 * the official task prefixes, not a hand-written paraphrase;
 * mean pooling from the model's own sentence-transformers config;
-* 256d Matryoshka truncation, then L2 normalization (truncation does not keep
-  the vector unit length);
+* the full 768d output, then L2 normalization. The model supports Matryoshka
+  truncation to 128/256/512d, but the index keeps the native dimension (#28);
 * a finite-value check before any vector reaches the database.
 """
 
@@ -26,7 +26,7 @@ from typing import Protocol
 
 import numpy as np
 
-DIMS = 256
+DIMS = 768  # native EmbeddingGemma 2 width; MRL would allow 128/256/512
 QUERY_PREFIX = "task: question answering | query: "
 DOCUMENT_PREFIX = "title: {title} | text: {text}"
 DEFAULT_MODEL = Path.home() / "Models" / "embeddinggemma2"
