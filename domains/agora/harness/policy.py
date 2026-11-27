@@ -37,9 +37,9 @@ FINAL_ANSWER_NUDGE = ("This is the last final turn. The python tool is no longer
                       "available. Call the answer tool now with the final value "
                       "only. If you are not certain, submit your best supported "
                       "value; do not guess one.")
-# Agora's official setting is 1.0; the cloud run uses 0.6. cli.py passes this
-# and MAX_TOKENS to the endpoint when it wraps the client.
-TEMPERATURE = float(os.environ.get("AGORA_TEMPERATURE", "1.0"))
+# Agora's official setting is 1.0; the local and cloud runs use 0.6. cli.py
+# passes this and MAX_TOKENS to the endpoint when it wraps the client.
+TEMPERATURE = float(os.environ.get("AGORA_TEMPERATURE", "0.6"))
 MAX_TOKENS = 8192        # 1024 cut the reasoning short; 4096 was never
                          # saturated, 8192 gives a hard reasoning turn more room.
 EMPTY_TURN_RETRIES = 2   # bounded re-prompts when an assistant turn has no content
@@ -60,7 +60,7 @@ GREP_PER_FILE = 3
 PY_CHARS = 4000          # python stdout+stderr kept
 PY_TIMEOUT = 60          # seconds
 
-# ~12k tokens of prompt at the 4 chars/token estimate, trimmed
-# oldest-tool-first. The local H0 keeps 48000 so the 3600 s timeout stays
-# reachable; the cloud run uses 96000 of its 262k-token window.
-CONTEXT_CHARS = int(os.environ.get("AGORA_CONTEXT_CHARS", "48000"))
+# ~24k tokens of prompt at the 4 chars/token estimate, trimmed
+# oldest-tool-first. The local and cloud runs use 96000; the 262k-token window
+# leaves room for the completion and the next turn.
+CONTEXT_CHARS = int(os.environ.get("AGORA_CONTEXT_CHARS", "96000"))

@@ -31,10 +31,10 @@ def _read(**overrides: str) -> list:
     return json.loads(result.stdout)
 
 
-def test_defaults_are_the_local_h0_values():
-    assert _read() == [1.0, 48000]
+def test_defaults_are_0_6_and_96000():
+    assert _read() == [0.6, 96000]
 
 
 def test_env_overrides_are_used():
-    values = _read(AGORA_TEMPERATURE="0.6", AGORA_CONTEXT_CHARS="96000")
-    assert values == [0.6, 96000]
+    values = _read(AGORA_TEMPERATURE="0.3", AGORA_CONTEXT_CHARS="120000")
+    assert values == [0.3, 120000]
