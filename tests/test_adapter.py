@@ -136,6 +136,22 @@ def test_env_args_forward_the_reranker_endpoint(monkeypatch):
     assert "AGORA_RERANK_MODEL=Qwen3-Reranker-0.6B" in args
 
 
+def test_env_args_forward_the_policy_budget(monkeypatch):
+    monkeypatch.setenv("AGORA_TEMPERATURE", "0.6")
+    monkeypatch.setenv("AGORA_CONTEXT_CHARS", "96000")
+    args = ADAPTER._env_args()
+    assert "AGORA_TEMPERATURE=0.6" in args
+    assert "AGORA_CONTEXT_CHARS=96000" in args
+
+
+def test_env_args_omit_unset_policy_budget(monkeypatch):
+    monkeypatch.delenv("AGORA_TEMPERATURE", raising=False)
+    monkeypatch.delenv("AGORA_CONTEXT_CHARS", raising=False)
+    args = ADAPTER._env_args()
+    assert not any(arg.startswith("AGORA_TEMPERATURE=") for arg in args)
+    assert not any(arg.startswith("AGORA_CONTEXT_CHARS=") for arg in args)
+
+
 def test_stage_task_redacts_gold_and_keeps_one_domain(tmp_path, corpus):
     task = ADAPTER.task_map()[("Finance & Economics", "q_0001")]
     task_file = ADAPTER._stage_task(tmp_path / "stage", task)

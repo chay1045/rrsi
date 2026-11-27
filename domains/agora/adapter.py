@@ -254,7 +254,8 @@ def _require_image(image: str) -> str:
 def _env_args() -> list[str]:
     """Only the variables the episode needs. Never forward the host env."""
     names = ("AGORA_MODEL", "OPENAI_BASE_URL", "OPENAI_API_KEY", "AGORA_LIVE",
-             "AGORA_RERANK_URL", "AGORA_RERANK_MODEL")
+             "AGORA_RERANK_URL", "AGORA_RERANK_MODEL", "AGORA_TEMPERATURE",
+             "AGORA_CONTEXT_CHARS")
     args: list[str] = []
     for name in names:
         value = os.environ.get(name)

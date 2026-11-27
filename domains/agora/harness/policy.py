@@ -2,7 +2,13 @@
 
 Char budgets, not token budgets: the tool layer never sees the policy
 tokenizer, and 4 chars/token keeps the estimate one line.
+
+``TEMPERATURE`` and ``CONTEXT_CHARS`` read a run-wide override so the same
+harness serves the local and cloud policies. The defaults are the local H0
+values; the adapter forwards the variables into the sandbox.
 """
+
+import os
 
 K = 5                    # search_docs default hits per call. Ten hits double
                          # the tool result, so the default stays at 5; a caller
@@ -31,10 +37,11 @@ FINAL_ANSWER_NUDGE = ("This is the last final turn. The python tool is no longer
                       "available. Call the answer tool now with the final value "
                       "only. If you are not certain, submit your best supported "
                       "value; do not guess one.")
-TEMPERATURE = 1.0        # Agora's official setting; cli.py passes these two
-MAX_TOKENS = 8192        # to the endpoint when it wraps the client. 1024 cut the
-                         # reasoning short; 4096 was never saturated, 8192 gives
-                         # a hard reasoning turn more room.
+# Agora's official setting is 1.0; the cloud run uses 0.6. cli.py passes this
+# and MAX_TOKENS to the endpoint when it wraps the client.
+TEMPERATURE = float(os.environ.get("AGORA_TEMPERATURE", "1.0"))
+MAX_TOKENS = 8192        # 1024 cut the reasoning short; 4096 was never
+                         # saturated, 8192 gives a hard reasoning turn more room.
 EMPTY_TURN_RETRIES = 2   # bounded re-prompts when an assistant turn has no content
                          # and no tool call, instead of ending the episode
 EMPTY_TURN_NUDGE = ("Your last reply was empty. Call one tool now. "
@@ -53,6 +60,7 @@ GREP_PER_FILE = 3
 PY_CHARS = 4000          # python stdout+stderr kept
 PY_TIMEOUT = 60          # seconds
 
-CONTEXT_CHARS = 48000    # ~12k tokens of prompt, trimmed oldest-tool-first. The
-                         # prompt budget stays fixed: with 100 turns, raising it
-                         # risks the 3600 s timeout; the read slice is larger.
+# ~12k tokens of prompt at the 4 chars/token estimate, trimmed
+# oldest-tool-first. The local H0 keeps 48000 so the 3600 s timeout stays
+# reachable; the cloud run uses 96000 of its 262k-token window.
+CONTEXT_CHARS = int(os.environ.get("AGORA_CONTEXT_CHARS", "48000"))
