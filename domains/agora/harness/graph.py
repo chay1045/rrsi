@@ -311,6 +311,10 @@ def build(client=None, ctx: tools.Context | None = None, summarize=None,
         request = messages
         if ephemeral:
             request = request + [{"role": "user", "content": ephemeral}]
+            if predicted is not None:
+                counted = _exact_tokens(count, request, specs)
+                if counted is not None:
+                    predicted = counted
         reply = dict(client(request, specs, force=force))
         update["messages"] = messages + [reply]
         usage = reply.get("usage")

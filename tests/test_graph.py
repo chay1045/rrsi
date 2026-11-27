@@ -321,6 +321,29 @@ def test_repeated_search_with_unchanged_result_is_nudged_once(monkeypatch):
     assert state["answer"] == "1"
 
 
+def test_ephemeral_nudge_is_included_in_the_exact_count(monkeypatch):
+    monkeypatch.setattr(tools, "dispatch", lambda name, args, ctx: "same")
+    pending = [call("grep", {"pattern": "x"}, "c1"),
+               call("grep", {"pattern": "x"}, "c2"),
+               call("answer", {"value": "1"}, "c3")]
+
+    def count(messages, specs=None):
+        return 100 + sum(len(str(m.get("content") or "")) for m in messages)
+
+    def client(messages, specs, force=None):
+        reply = dict(pending.pop(0))
+        reply["usage"] = {"prompt_tokens": count(messages, specs)}
+        return reply
+
+    state = graph.run("q", client, CTX, count=count)
+
+    # The nudge turn's predicted count includes the ephemeral user message.
+    nudge_turn = [record for record in state["token_drift"]
+                  if record["turn"] == 3][0]
+    assert nudge_turn["predicted"] == nudge_turn["actual"]
+    assert nudge_turn["ratio"] == 0.0
+
+
 def test_repeat_nudge_is_not_appended_in_the_final_phase(monkeypatch):
     monkeypatch.setattr(policy, "MAX_TURNS", 3)
     monkeypatch.setattr(policy, "FINAL_TURNS", 2)
