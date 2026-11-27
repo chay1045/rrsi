@@ -57,9 +57,9 @@ def search_docs(query: str, k: int | None = None, ctx: Context = None) -> str:
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
         reranker = index_search.default_reranker() if policy.RERANK else None
-        hits = index_search.hybrid_search(con, query, k, reranker=reranker)
+        hits = index_search.hybrid_search_ranked(con, query, k, reranker=reranker)
         blocks = []
-        for position, (doc_path, line_start, line_end) in enumerate(hits, 1):
+        for position, (doc_path, line_start, line_end, score) in enumerate(hits, 1):
             row = con.execute(
                 "SELECT heading_path, text FROM chunks"
                 " WHERE doc_path = ? AND line_start = ? AND line_end = ? LIMIT 1",
@@ -69,8 +69,11 @@ def search_docs(query: str, k: int | None = None, ctx: Context = None) -> str:
             snippet = text[:policy.SNIPPET_CHARS]
             if len(text) > policy.SNIPPET_CHARS:
                 snippet += " ..."
+            label = index_search.confidence(score)
+            prefix = (f"[{position}] {label} {doc_path}" if label
+                      else f"[{position}] {doc_path}")
             blocks.append(
-                f"[{position}] {doc_path}:{line_start}-{line_end}\n"
+                f"{prefix}:{line_start}-{line_end}\n"
                 f"{heading}\n{snippet}")
     finally:
         con.close()
@@ -250,7 +253,9 @@ PYTHON_SPEC = _spec(
 SPECS = [
     _spec("search_docs",
           "Hybrid keyword and semantic search over the domain's documents. "
-          "Returns path, line range and a short snippet per hit.",
+          "Returns path, line range, snippet and, when reranking is on, a "
+          "high/low confidence per hit, with at most two chunks per document. "
+          "Returns (no hits) when the best rerank score is too low.",
           {"query": {"type": "string", "description": "what to find, in the question's terms"},
            "k": {"type": "integer", "minimum": 1, "maximum": policy.MAX_K,
                  "description": (f"hits to return (default {policy.K}, "

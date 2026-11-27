@@ -2,6 +2,7 @@
 
     python3 -m pytest -q tests/test_evaluate.py
 """
+import sqlite3
 import sys
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
@@ -137,3 +138,80 @@ def test_ablation_report_marks_the_rerank_as_measured():
     markdown = evaluate.ablation_report(runs, 2.0)
     assert "measured below" in markdown
     assert "worth measuring" not in markdown
+
+
+def test_report_names_the_requested_depth():
+    markdown = evaluate.report({"A": [(1, 1)]}, "hybrid", 1.0, k=5)
+    assert "top-5 chunks" in markdown
+    assert "recall_file@5" in markdown
+    assert "Gate 2 (recall_file@5" in markdown
+
+
+def _search_db(path, hits):
+    """A chunks table with the metadata ``hybrid_ranked`` rereads."""
+    con = sqlite3.connect(path)
+    con.execute(
+        "CREATE TABLE chunks (chunk_id INTEGER PRIMARY KEY, doc_path TEXT,"
+        " line_start INTEGER, line_end INTEGER, heading_path TEXT, text TEXT)")
+    con.executemany(
+        "INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?)",
+        [(hit[0], hit[1], hit[2], hit[3], f"Heading {hit[0]}", f"text {hit[0]}")
+         for hit in hits])
+    con.commit()
+    return con
+
+
+def _fuse(monkeypatch, hits):
+    monkeypatch.setattr(search, "bm25_chunks", lambda con, query, k: hits)
+    monkeypatch.setattr(search, "dense_chunks", lambda con, vector, k: hits)
+
+
+class FixedReranker:
+    def __init__(self, scores):
+        self.scores = scores
+
+    def score(self, query, documents):
+        assert len(documents) == len(self.scores)
+        return list(self.scores)
+
+
+def test_ranked_results_cap_chunks_per_document(tmp_path, monkeypatch):
+    hits = ([(index, "documents/A.md", index, index) for index in range(1, 6)]
+            + [(index, "documents/B.md", index, index) for index in range(6, 11)]
+            + [(index, "documents/C.md", index, index) for index in range(11, 16)])
+    con = _search_db(tmp_path / "index.sqlite", hits)
+    try:
+        _fuse(monkeypatch, hits)
+        ranked = search.hybrid_ranked(
+            con, "q", [0.0], k=5, depth=len(hits),
+            reranker=FixedReranker(list(range(len(hits), 0, -1))))
+        docs = [hit[1] for hit, _ in ranked]
+        assert len(docs) == 5
+        assert [docs.count(doc) for doc in
+                ("documents/A.md", "documents/B.md", "documents/C.md")] == [2, 2, 1]
+    finally:
+        con.close()
+
+
+def test_best_score_below_the_floor_returns_no_hits(tmp_path, monkeypatch):
+    hits = [(index, f"documents/{index}.md", index, index) for index in range(1, 6)]
+    con = _search_db(tmp_path / "index.sqlite", hits)
+    try:
+        _fuse(monkeypatch, hits)
+        ranked = search.hybrid_ranked(
+            con, "q", [0.0], k=5, depth=len(hits),
+            reranker=FixedReranker([search.MIN_RERANK_SCORE / 2] * len(hits)))
+        assert ranked == []
+
+        kept = search.hybrid_ranked(
+            con, "q", [0.0], k=5, depth=len(hits),
+            reranker=FixedReranker([search.MIN_RERANK_SCORE] * len(hits)))
+        assert len(kept) == len(hits)
+    finally:
+        con.close()
+
+
+def test_confidence_label_is_coarse():
+    assert search.confidence(None) is None
+    assert search.confidence(search.HIGH_RERANK_SCORE) == "high"
+    assert search.confidence(search.HIGH_RERANK_SCORE - 0.01) == "low"

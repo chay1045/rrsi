@@ -1,20 +1,22 @@
 """Gate 2: retrieval quality with zero rollouts -- no GPU, no policy, no judge.
 
     python3 domains/agora/index/evaluate.py --mode bm25 --out ../../docs/retrieval.md
+    python3 domains/agora/index/evaluate.py --mode hybrid --rerank --k 5
 
 Modes: ``bm25``, ``dense`` and ``hybrid``. Repeat ``--mode`` to write one
 ablation report. Dense and hybrid need ``build.py --embed`` and the local
-EmbeddingGemma 2 text tower.
+EmbeddingGemma 2 text tower. ``--k`` matches the tool's depth; the default 10
+keeps the original Gate-2 table comparable.
 
 ``--rerank`` adds a ``hybrid+rerank`` run next to ``hybrid``: the RRF top-50 is
 rescored by the Qwen3-Reranker service (issue #15), and the report states the
 recall delta, a paired-bootstrap confidence interval and the score latency.
 
-For every task, retrieve the top-10 chunks from the domain's index and score:
+For every task, retrieve the top-``k`` chunks (``--k``, default 10) and score:
 
-    recall_file@10    a retrieved chunk's doc_path is one of the task's reference_files
-    recall_region@10  ... and the chunk's line range overlaps the gold page range
-    MRR@10            mean reciprocal rank of the first gold-file chunk
+    recall_file@k    a retrieved chunk's doc_path is one of the task's reference_files
+    recall_region@k  ... and the chunk's line range overlaps the gold page range
+    MRR@k            mean reciprocal rank of the first gold-file chunk
 
 Gold pages become line ranges through the ``<!-- pages a-b -->`` markers Agora's
 parser left in the markdown. A reference with no page range (every xlsx/csv, some
@@ -102,12 +104,14 @@ def ranks(hits: list[tuple[str, int, int]], refs: list[dict],
 def evaluate(domains: list[str],
              all_tasks: dict[tuple[str, str], agora_tasks.Task],
              mode: str = "bm25", embedder=None,
-             depth: int = DEPTH, reranker=None
+             depth: int = DEPTH, reranker=None, k: int = K
              ) -> dict[str, list[tuple[int | None, int | None]]]:
     if mode not in MODES:
         raise ValueError(f"unknown mode {mode!r}; choose from {', '.join(MODES)}")
     if mode != "bm25" and embedder is None:
         raise ValueError(f"mode {mode!r} needs an embedder")
+    if k < 1:
+        raise ValueError(f"k must be positive, got {k}")
     per_domain: dict[str, list[tuple[int | None, int | None]]] = {}
     for domain in domains:
         db_path = build.INDEX_DIR / f"{build._slug(domain)}.sqlite"
@@ -124,11 +128,11 @@ def evaluate(domains: list[str],
             scored = []
             for position, task in enumerate(rows):
                 if mode == "bm25":
-                    found = bm25_chunks(con, task.query, K)
+                    found = bm25_chunks(con, task.query, k)
                 elif mode == "dense":
-                    found = dense_chunks(con, vectors[position], K)
+                    found = dense_chunks(con, vectors[position], k)
                 else:
-                    found = hybrid_chunks(con, task.query, vectors[position], K,
+                    found = hybrid_chunks(con, task.query, vectors[position], k,
                                           depth, reranker)
                 hits = [(doc_path, line_start, line_end)
                         for _, doc_path, line_start, line_end in found]
@@ -205,15 +209,15 @@ def paired_delta(per_domain: dict[str, list[tuple[int | None, int | None]]],
 
 
 def report(per_domain: dict[str, list[tuple[int | None, int | None]]], mode: str,
-           elapsed: float) -> str:
+           elapsed: float, k: int = K) -> str:
     everything = [pair for scored in per_domain.values() for pair in scored]
     lines = [
         "# Retrieval quality (Gate 2)",
         "",
-        f"Mode `{mode}`, top-{K} chunks, {len(everything)} tasks, "
+        f"Mode `{mode}`, top-{k} chunks, {len(everything)} tasks, "
         f"generated {date.today().isoformat()} in {elapsed:.0f}s.",
         "",
-        "| domain | tasks | recall_file@10 | recall_region@10 | MRR@10 |",
+        f"| domain | tasks | recall_file@{k} | recall_region@{k} | MRR@{k} |",
         "|---|---|---|---|---|",
         *[_row(domain, scored) for domain, scored in per_domain.items()],
         _row("**all**", everything),
@@ -221,7 +225,7 @@ def report(per_domain: dict[str, list[tuple[int | None, int | None]]], mode: str
     ]
     recall_file = sum(1 for file_rank, _ in everything if file_rank is not None) / len(everything)
     recall_region = sum(1 for _, r in everything if r is not None) / len(everything)
-    lines.append(f"Gate 2 (recall_file@10 >= {GATE:.2f}): "
+    lines.append(f"Gate 2 (recall_file@{k} >= {GATE:.2f}): "
                  f"**{'PASS' if recall_file >= GATE else 'FAIL'}** ({recall_file:.3f}).")
     if recall_file < GATE:
         if mode == "bm25":
@@ -252,19 +256,19 @@ def report(per_domain: dict[str, list[tuple[int | None, int | None]]], mode: str
 def ablation_report(runs: dict[str, tuple[dict[str, list[tuple[int | None, int | None]]],
                                           float]],
                     elapsed: float, rerank_seconds: float = 0.0,
-                    rerank_calls: int = 0) -> str:
+                    rerank_calls: int = 0, k: int = K) -> str:
     """One report for repeated ``--mode`` flags: summary, per-domain tables, verdict."""
     first = next(iter(runs.values()))[0]
     tasks = sum(len(scored) for scored in first.values())
     lines = [
         "# Retrieval quality (Gate 2)",
         "",
-        f"Top-{K} chunks, {tasks} tasks, generated {date.today().isoformat()} "
+        f"Top-{k} chunks, {tasks} tasks, generated {date.today().isoformat()} "
         f"in {elapsed:.0f}s.",
         "",
         "## Ablation",
         "",
-        "| mode | tasks | recall_file@10 | recall_region@10 | MRR@10 | seconds |",
+        f"| mode | tasks | recall_file@{k} | recall_region@{k} | MRR@{k} | seconds |",
         "|---|---|---|---|---|---|",
     ]
     metrics: dict[str, tuple[float, float, float]] = {}
@@ -278,7 +282,7 @@ def ablation_report(runs: dict[str, tuple[dict[str, list[tuple[int | None, int |
         lines += [
             f"### {mode}",
             "",
-            "| domain | tasks | recall_file@10 | recall_region@10 | MRR@10 |",
+            f"| domain | tasks | recall_file@{k} | recall_region@{k} | MRR@{k} |",
             "|---|---|---|---|---|",
             *[_row(domain, scored) for domain, scored in per_domain.items()],
             _row("**all**", [pair for scored in per_domain.values() for pair in scored]),
@@ -288,7 +292,7 @@ def ablation_report(runs: dict[str, tuple[dict[str, list[tuple[int | None, int |
     hybrid = metrics.get("hybrid")
     if hybrid is not None:
         gate = hybrid[0] >= GATE
-        lines.append(f"Gate 2 (recall_file@10 >= {GATE:.2f}): "
+        lines.append(f"Gate 2 (recall_file@{k} >= {GATE:.2f}): "
                      f"**{'PASS' if gate else 'FAIL'}** ({hybrid[0]:.3f}).")
         if not gate:
             lines.append(
@@ -305,7 +309,7 @@ def ablation_report(runs: dict[str, tuple[dict[str, list[tuple[int | None, int |
             lines.append("Hybrid clears both file and region recall at the gate.")
         expected = [m for m in ("bm25", "dense", "hybrid") if m in metrics]
         deviations = []
-        names = ("recall_file@10", "recall_region@10", "MRR@10")
+        names = (f"recall_file@{k}", f"recall_region@{k}", f"MRR@{k}")
         for left, right in zip(expected, expected[1:]):
             for name, low, high in zip(names, metrics[left], metrics[right]):
                 if high < low:
@@ -333,11 +337,11 @@ def ablation_report(runs: dict[str, tuple[dict[str, list[tuple[int | None, int |
                    f"({1000 * rerank_seconds / n:.1f} ms/task)")
         lines += [
             "",
-            f"Rerank delta: recall_file@10 {delta:+.3f}, 95% CI "
+            f"Rerank delta: recall_file@{k} {delta:+.3f}, 95% CI "
             f"[{low:+.3f}, {high:+.3f}] (paired bootstrap, n={n}, "
             f"10000 resamples). {verdict}",
-            f"recall_region@10 {rerank[1] - hybrid[1]:+.3f}; "
-            f"MRR@10 {rerank[2] - hybrid[2]:+.3f}. Score latency: {latency}.",
+            f"recall_region@{k} {rerank[1] - hybrid[1]:+.3f}; "
+            f"MRR@{k} {rerank[2] - hybrid[2]:+.3f}. Score latency: {latency}.",
         ]
         if rerank[0] >= GATE and rerank[1] >= GATE:
             lines.append("Rerank clears both file and region recall at the gate.")
@@ -360,8 +364,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--out", type=Path, help="write the markdown here, default stdout")
     parser.add_argument("--rerank", action="store_true",
                         help="also run hybrid+rerank (needs scripts/serve_rerank.sh)")
+    parser.add_argument("--k", type=int, default=K,
+                        help=f"chunks per task (default {K}, the tool's default is 5)")
     args = parser.parse_args(argv)
 
+    if args.k < 1:
+        parser.error("--k must be positive")
     modes = list(dict.fromkeys(args.mode or ("hybrid" if args.rerank else ["bm25"])))
     if args.rerank and "hybrid" not in modes:
         parser.error("--rerank needs the hybrid mode; add --mode hybrid")
@@ -386,22 +394,23 @@ def main(argv: list[str] | None = None) -> None:
     runs: dict[str, tuple[dict[str, list[tuple[int | None, int | None]]], float]] = {}
     for mode in modes:
         mode_started = time.perf_counter()
-        per_domain = evaluate(domains, all_tasks, mode=mode, embedder=embedder)
+        per_domain = evaluate(domains, all_tasks, mode=mode, embedder=embedder,
+                              k=args.k)
         runs[mode] = (per_domain, time.perf_counter() - mode_started)
     if reranker is not None:
         mode_started = time.perf_counter()
         per_domain = evaluate(domains, all_tasks, mode="hybrid", embedder=embedder,
-                              reranker=reranker)
+                              reranker=reranker, k=args.k)
         runs["hybrid+rerank"] = (per_domain, time.perf_counter() - mode_started)
     elapsed = time.perf_counter() - started
     if len(runs) == 1:
         mode, (per_domain, _) = next(iter(runs.items()))
-        markdown = report(per_domain, mode, elapsed)
+        markdown = report(per_domain, mode, elapsed, k=args.k)
     else:
         markdown = ablation_report(
             runs, elapsed,
             rerank_seconds=reranker.seconds if reranker else 0.0,
-            rerank_calls=reranker.calls if reranker else 0)
+            rerank_calls=reranker.calls if reranker else 0, k=args.k)
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(markdown, encoding="utf-8")

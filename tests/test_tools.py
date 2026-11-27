@@ -39,15 +39,16 @@ def _context(tmp_path: Path, rows: int = 10) -> tools.Context:
 
 @pytest.fixture
 def indexed(tmp_path, monkeypatch):
-    """Real chunks table plus a fake hybrid search that returns its first k."""
+    """Real chunks table plus a fake ranked search that returns its first k."""
     ctx = _context(tmp_path)
 
     def fake_hybrid(con, query, k, **kwargs):
-        return con.execute(
+        rows = con.execute(
             "SELECT doc_path, line_start, line_end FROM chunks"
             " ORDER BY chunk_id LIMIT ?", (k,)).fetchall()
+        return [(*row, None) for row in rows]
 
-    monkeypatch.setattr(tools.index_search, "hybrid_search", fake_hybrid)
+    monkeypatch.setattr(tools.index_search, "hybrid_search_ranked", fake_hybrid)
     monkeypatch.setattr(tools.index_search, "default_reranker", lambda: None)
     monkeypatch.setattr(policy, "RERANK", False)
     return ctx
@@ -68,7 +69,7 @@ def test_omitted_k_uses_the_default(indexed, monkeypatch):
         seen.append(k)
         return []
 
-    monkeypatch.setattr(tools.index_search, "hybrid_search", fake_hybrid)
+    monkeypatch.setattr(tools.index_search, "hybrid_search_ranked", fake_hybrid)
     assert tools.search_docs("q", ctx=indexed) == "(no hits)"
     assert seen == [policy.K]
 
@@ -82,7 +83,7 @@ def test_k_is_clamped(indexed, monkeypatch, requested, effective):
         seen.append(k)
         return []
 
-    monkeypatch.setattr(tools.index_search, "hybrid_search", fake_hybrid)
+    monkeypatch.setattr(tools.index_search, "hybrid_search_ranked", fake_hybrid)
     tools.search_docs("q", k=requested, ctx=indexed)
     assert seen == [effective]
 
@@ -114,6 +115,35 @@ def test_graph_passes_the_requested_depth_to_search_docs(indexed):
     assert state["answer"] == "done"
 
 
+def test_search_docs_labels_the_rerank_confidence(indexed, monkeypatch):
+    def fake_hybrid(con, query, k, **kwargs):
+        return [("doc1.md", 1, 1, 0.9), ("doc2.md", 2, 2, 0.1)]
+
+    monkeypatch.setattr(tools.index_search, "hybrid_search_ranked", fake_hybrid)
+    output = tools.search_docs("q", k=2, ctx=indexed)
+    assert "[1] high doc1.md:1-1" in output
+    assert "[2] low doc2.md:2-2" in output
+
+
+def test_search_output_stays_within_the_snippet_budget(indexed, monkeypatch):
+    con = sqlite3.connect(indexed.index_dir / "test-domain.sqlite")
+    try:
+        con.execute(
+            "UPDATE chunks SET heading_path = ?, text = ? WHERE chunk_id = 1",
+            ("H" * 200, "x" * (10 * policy.SNIPPET_CHARS)))
+        con.commit()
+    finally:
+        con.close()
+
+    def fake_hybrid(con, query, k, **kwargs):
+        return [("doc1.md", 1, 1, 0.9)] * k
+
+    monkeypatch.setattr(tools.index_search, "hybrid_search_ranked", fake_hybrid)
+    output = tools.search_docs("q", k=policy.K, ctx=indexed)
+    assert output.count(" ...") == policy.K
+    assert len(output) < policy.K * (policy.SNIPPET_CHARS + 512)
+
+
 def test_search_spec_states_the_default_and_maximum():
     spec = next(item for item in tools.SPECS
                 if item["function"]["name"] == "search_docs")
@@ -122,3 +152,11 @@ def test_search_spec_states_the_default_and_maximum():
     assert prop["maximum"] == policy.MAX_K
     assert str(policy.K) in prop["description"]
     assert str(policy.MAX_K) in prop["description"]
+
+
+def test_search_spec_describes_diversity_and_confidence():
+    spec = next(item for item in tools.SPECS
+                if item["function"]["name"] == "search_docs")
+    description = spec["function"]["description"].lower()
+    assert "two chunks per document" in description
+    assert "high/low" in description

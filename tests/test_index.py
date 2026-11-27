@@ -261,7 +261,7 @@ def test_embedded_domain_tables_and_knn(tmp_path):
 
         class Tied:
             def score(self, query, documents):
-                return [0.0] * len(documents)
+                return [1.0] * len(documents)
 
         assert search.hybrid_chunks(
             con, "alpha", FakeEmbedder.vector("zebra"), k=2, reranker=Tied()

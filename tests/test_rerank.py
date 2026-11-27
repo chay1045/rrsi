@@ -107,7 +107,7 @@ def test_search_docs_honours_the_off_switch(monkeypatch, tmp_path):
         seen.append(kwargs.get("reranker"))
         return []
 
-    monkeypatch.setattr(tools.index_search, "hybrid_search", fake_hybrid)
+    monkeypatch.setattr(tools.index_search, "hybrid_search_ranked", fake_hybrid)
     monkeypatch.setattr(tools.index_search, "default_reranker", lambda: sentinel)
 
     monkeypatch.setattr(policy, "RERANK", False)
