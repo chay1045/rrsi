@@ -14,8 +14,9 @@ failure writes ``"UNKNOWN"`` in the trajectory only, records ``infra_error``
 and exits non-zero.
 
 Env: ``AGORA_DATA``, ``AGORA_INDEX``, ``AGORA_EMBEDDER``, ``AGORA_DOMAIN``,
-``AGORA_MODEL``, ``OPENAI_BASE_URL``, ``OPENAI_API_KEY``,
-``AGORA_REQUEST_RETRIES``, ``AGORA_REQUEST_TIMEOUT_S``, ``AGORA_SEED``.
+``AGORA_MODEL``, ``OPENAI_BASE_URL``, ``OPENAI_API_KEY``, ``AGORA_RERANK``
+(the adapter's per-run pin), ``AGORA_REQUEST_RETRIES``,
+``AGORA_REQUEST_TIMEOUT_S``, ``AGORA_SEED``.
 """
 
 from __future__ import annotations
@@ -197,11 +198,18 @@ class _Live:
             return f"[live] TOOL ERROR {f['name']} {f['error']}"
         if kind == "run_error":
             return f"[live] RUN ERROR {f['error']}"
+        if kind == "rerank_fallback":
+            return (f"[live] RERANK FALLBACK {f['name']} "
+                    f"calls={f['calls']} fallbacks={f['fallbacks']} "
+                    f"error={f['error']}")
         if kind == "final":
+            retrieval = f.get("retrieval") or {}
             return (f"[live] FINAL status={f['status']} "
                     f"answered={f.get('answered')} turns={f['turns']} "
                     f"tokens={(f.get('usage') or {}).get('total_tokens')} "
                     f"retries={f.get('retries')} "
+                    f"rerank_fallback={retrieval.get('rerank_fallbacks') or 0}/"
+                    f"{retrieval.get('rerank_calls') or 0} "
                     f"answer={_clip(f.get('answer'), 1200)} error={f.get('error')}")
         if kind == "skipped":
             return f"[live] SKIP task={f['task']} trial={f['trial']}"
@@ -411,6 +419,29 @@ def _already_answered(out: Path) -> bool:
             and answer.upper() != "UNKNOWN")
 
 
+def _retrieval_stats() -> dict:
+    """The frozen search counters; empty when the harness hides them."""
+    search = getattr(tools, "index_search", None)
+    reader = getattr(search, "retrieval_stats", None)
+    if not callable(reader):
+        return {}
+    try:
+        return dict(reader())
+    except Exception:  # observability must not end an episode
+        return {}
+
+
+def _reset_retrieval_stats() -> None:
+    search = getattr(tools, "index_search", None)
+    reset = getattr(search, "reset_retrieval_stats", None)
+    if not callable(reset):
+        return
+    try:
+        reset()
+    except Exception:
+        pass
+
+
 def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
              ctx: tools.Context | None = None, summarize=None,
              notes=None, count=None) -> dict:
@@ -431,6 +462,7 @@ def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
                 "retries": 0, "turns": 0, "usage": {"total_tokens": 0}}
     scratch = out / "scratch"
     scratch.mkdir(parents=True, exist_ok=True)
+    _reset_retrieval_stats()
     previous_scratch = os.environ.get("AGORA_SCRATCH")
 
     usage: dict = {}
@@ -480,12 +512,23 @@ def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
 
     def dispatch(name, args, ctx):
         log("tool_call", name=name, args=args)
+        before = _retrieval_stats()
         try:
             result = original_dispatch(name, args, ctx)
         except BaseException as exc:
             log("tool_error", name=name, error=f"{type(exc).__name__}: {exc}")
             raise
         log("tool_result", name=name, result=str(result))
+        after = _retrieval_stats()
+        if (int(after.get("rerank_fallbacks") or 0)
+                > int(before.get("rerank_fallbacks") or 0)):
+            message = str(after.get("last_rerank_error")
+                          or "reranker unavailable")
+            print(f"warning: rerank fallback: {message}", file=sys.stderr,
+                  flush=True)
+            log("rerank_fallback", name=name, error=message,
+                calls=after.get("rerank_calls"),
+                fallbacks=after.get("rerank_fallbacks"))
         return result
 
     tools.dispatch = dispatch
@@ -559,8 +602,9 @@ def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
     retries = int(stats.get("retries", 0)) if isinstance(stats, dict) else 0
 
     usage.setdefault("total_tokens", 0)
+    retrieval = _retrieval_stats()
     log("final", status=status, answered=answered, turns=turns, answer=answer,
-        usage=usage, retries=retries, error=error)
+        usage=usage, retries=retries, error=error, retrieval=retrieval)
     trajectory = {
         "task": task.id,
         "domain": task.domain,
@@ -576,6 +620,7 @@ def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
         "turns": turns,
         "wall_time_s": wall_time,
         "usage": usage,
+        "retrieval": retrieval,
         "compactions": compactions,
         "token_drift": drift,
         "tool_calls": tool_calls,

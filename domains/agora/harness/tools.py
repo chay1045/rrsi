@@ -56,8 +56,9 @@ def search_docs(query: str, k: int | None = None, ctx: Context = None) -> str:
     k = min(max(requested, 1), policy.MAX_K)
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
-        reranker = index_search.default_reranker() if policy.RERANK else None
-        hits = index_search.hybrid_search_ranked(con, query, k, reranker=reranker)
+        # The frozen search module resolves the per-run pin. The harness has no
+        # switch; a dead service returns the RRF order and records the fallback.
+        hits = index_search.hybrid_search_ranked(con, query, k)
         blocks = []
         for position, (doc_path, line_start, line_end, score) in enumerate(hits, 1):
             row = con.execute(

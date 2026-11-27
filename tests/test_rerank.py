@@ -1,4 +1,4 @@
-"""Issue #15: the /score client, batching and the harness off switch."""
+"""Issue #15 and #32: the /score client, batching, the pin and the fallback."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import json
 import sqlite3
 import sys
 import threading
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -15,9 +16,10 @@ ROOT = Path(__file__).resolve().parents[1]
 AGORA = ROOT / "domains" / "agora"
 sys.path.insert(0, str(AGORA))
 
-import harness.policy as policy  # noqa: E402
+import cli  # noqa: E402
 import harness.tools as tools  # noqa: E402
 import rerank  # noqa: E402  (tools.py put index/ on sys.path)
+import search  # noqa: E402
 
 
 class ScoreHandler(BaseHTTPRequestHandler):
@@ -46,6 +48,16 @@ class ScoreHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *args) -> None:
         pass
+
+
+@pytest.fixture(autouse=True)
+def clean_retrieval_state():
+    """Each test starts with a closed circuit and empty counters."""
+    rerank.reset_breaker()
+    search.reset_retrieval_stats()
+    yield
+    rerank.reset_breaker()
+    search.reset_retrieval_stats()
 
 
 @pytest.fixture
@@ -80,9 +92,9 @@ def test_score_rejects_a_short_response(score_server):
         rerank.VllmReranker(url=score_server).score("q", ["a", "b"])
 
 
-def test_missing_service_names_the_switch():
+def test_missing_service_names_the_fallback():
     client = rerank.VllmReranker(url="http://127.0.0.1:1/score", timeout=0.2)
-    with pytest.raises(RuntimeError, match="RERANK=False"):
+    with pytest.raises(RuntimeError, match="RRF"):
         client.score("q", ["a", "b"])
 
 
@@ -94,26 +106,129 @@ def test_from_env_reads_the_endpoint(monkeypatch):
     assert client.model == "other-reranker"
 
 
-def test_search_docs_honours_the_off_switch(monkeypatch, tmp_path):
-    index_dir = tmp_path / "index"
-    index_dir.mkdir()
-    sqlite3.connect(index_dir / "test-domain.sqlite").close()
-    ctx = tools.Context(domain="Test Domain", data_dir=tmp_path,
-                        index_dir=index_dir)
+def test_transient_failure_is_retried_once(monkeypatch):
+    calls = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {"data": [{"index": 0, "score": 0.5}]}).encode()
+
+    def flaky(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise urllib.error.URLError("temporary")
+        return Response()
+
+    monkeypatch.setattr(rerank.urllib.request, "urlopen", flaky)
+    monkeypatch.setattr(rerank, "RETRY_DELAY_S", 0.0)
+
+    assert rerank.VllmReranker(url="http://x/score").score("q", ["a"]) == [0.5]
+    assert len(calls) == 2
+
+
+def test_dead_service_opens_the_breaker(monkeypatch):
+    calls = []
+
+    def dead(*args, **kwargs):
+        calls.append(1)
+        raise urllib.error.URLError("refused")
+
+    monkeypatch.setattr(rerank.urllib.request, "urlopen", dead)
+    monkeypatch.setattr(rerank, "RETRY_DELAY_S", 0.0)
+    client = rerank.VllmReranker(url="http://x/score")
+
+    with pytest.raises(RuntimeError, match="RRF"):
+        client.score("q", ["a"])
+    assert len(calls) == rerank.RETRIES + 1
+
+    # The breaker rejects the next search without a network call.
+    with pytest.raises(rerank.RerankUnavailable, match="circuit open"):
+        client.score("q", ["a"])
+    assert len(calls) == rerank.RETRIES + 1
+
+
+def test_search_uses_the_pinned_reranker(monkeypatch):
     sentinel = object()
     seen: list[object] = []
 
-    def fake_hybrid(con, query, k, **kwargs):
-        seen.append(kwargs.get("reranker"))
+    def fake_hybrid(con, query, vector, k, depth, **kwargs):
+        seen.append(kwargs["reranker"])
         return []
 
-    monkeypatch.setattr(tools.index_search, "hybrid_search_ranked", fake_hybrid)
-    monkeypatch.setattr(tools.index_search, "default_reranker", lambda: sentinel)
+    monkeypatch.setattr(search, "hybrid_ranked", fake_hybrid)
+    monkeypatch.setattr(rerank, "from_env", lambda: sentinel)
 
-    monkeypatch.setattr(policy, "RERANK", False)
-    assert tools.search_docs("q", ctx=ctx) == "(no hits)"
+    monkeypatch.setenv("AGORA_RERANK", "1")
+    assert search.hybrid_search_ranked(
+        None, "q", 5, encoder=lambda query: [0.0]) == []
+    assert seen[-1] is sentinel
+
+    monkeypatch.setenv("AGORA_RERANK", "0")
+    assert search.hybrid_search_ranked(
+        None, "q", 5, encoder=lambda query: [0.0]) == []
     assert seen[-1] is None
 
-    monkeypatch.setattr(policy, "RERANK", True)
-    assert tools.search_docs("q", ctx=ctx) == "(no hits)"
-    assert seen[-1] is sentinel
+
+def _context(tmp_path: Path) -> tools.Context:
+    index_dir = tmp_path / "index"
+    index_dir.mkdir()
+    con = sqlite3.connect(index_dir / "test-domain.sqlite")
+    con.execute(
+        "CREATE TABLE chunks (chunk_id INTEGER PRIMARY KEY, doc_path TEXT,"
+        " line_start INTEGER, line_end INTEGER, heading_path TEXT, text TEXT)")
+    con.executemany(
+        "INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?)",
+        [(1, "doc1.md", 1, 1, "Heading 1", "snippet 1"),
+         (2, "doc2.md", 2, 2, "Heading 2", "snippet 2")])
+    con.commit()
+    con.close()
+    return tools.Context(domain="Test Domain", data_dir=tmp_path,
+                         index_dir=index_dir)
+
+
+def test_dead_endpoint_returns_rrf_hits_and_the_episode_completes(
+        tmp_path, monkeypatch, capsys):
+    ctx = _context(tmp_path)
+    hits = [(1, "doc1.md", 1, 1), (2, "doc2.md", 2, 2)]
+
+    monkeypatch.setattr(search, "bm25_chunks", lambda con, query, k: hits)
+    monkeypatch.setattr(search, "dense_chunks", lambda con, vector, k: hits)
+    monkeypatch.setattr(search, "_chunk_texts",
+                        lambda con, ids: [f"text {index}" for index in ids])
+    monkeypatch.setattr(search, "_query_encoder",
+                        lambda: (lambda query: [0.0]))
+    monkeypatch.setenv("AGORA_RERANK", "1")
+    monkeypatch.setenv("AGORA_RERANK_URL", "http://127.0.0.1:1/score")
+
+    task = cli.tasks.Task("Test Domain", "q_0001", "what?", "done", [])
+    replies = [
+        {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "c1", "type": "function",
+            "function": {"name": "search_docs",
+                         "arguments": json.dumps({"query": "q"})}}]},
+        {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "c2", "type": "function",
+            "function": {"name": "answer",
+                         "arguments": json.dumps({"value": "done"})}}]},
+    ]
+
+    def client(messages, specs, force=None):
+        return dict(replies.pop(0))
+
+    trajectory = cli.run_task(task, tmp_path / "out", client=client, ctx=ctx)
+
+    assert trajectory["answered"] is True
+    assert trajectory["retrieval"]["rerank_calls"] == 1
+    assert trajectory["retrieval"]["rerank_fallbacks"] == 1
+    assert trajectory["retrieval"]["rerank_fallback"] is True
+    result = next(message["content"] for message in trajectory["messages"]
+                  if message.get("role") == "tool")
+    assert result.startswith("[1] ")
+    assert "rerank fallback" in capsys.readouterr().err

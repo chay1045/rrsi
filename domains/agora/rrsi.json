@@ -1,5 +1,5 @@
 {
-  "_doc": "Agora document-reasoning instance: 8 smoke / 24 evolve / 24 heldout tasks (frozen stratified split). S = exact normalized match over 24 x k trials. The base harness is the five-tool LangGraph loop; the policy runs in the agora-sandbox container. delta is null so calibrate measures it. w_s = 48 (one trial of 24 x 2) makes a single-trial gain worth 1 before the token-cost term. Retrieval edits are tagged client_tool and tool-output edits output_plumbing because RRSI's fixed vocabulary has no retrieval/tool_plumbing member.",
+  "_doc": "Agora document-reasoning instance: 8 smoke / 24 evolve / 24 heldout tasks (frozen stratified split). S = exact normalized match over 24 x k trials. The base harness is the five-tool LangGraph loop; the policy runs in the agora-sandbox container. delta is null so calibrate measures it. w_s = 48 (one trial of 24 x 2) makes a single-trial gain worth 1 before the token-cost term. Retrieval edits are tagged client_tool and tool-output edits output_plumbing because RRSI's fixed vocabulary has no retrieval/tool_plumbing member. rerank pins the cross-encoder for every episode outside the evolved harness; a dead service falls back to the RRF order and the fallback rate is recorded.",
   "T": 10, "k": 2, "m": 2,
   "b_min": 1, "b_max": 3, "w": 3, "m_draft": 1,
   "delta": null, "delta_z": 2.0,
@@ -8,6 +8,7 @@
   "n_prune": 4,
   "repair_rounds": 5, "invalid_missing_frac": 0.15,
   "n_fail_traces": 16, "n_success_traces": 4, "eval_parallel": 1,
+  "rerank": true,
   "sandbox_image": "agora-sandbox:1",
   "max_concurrent": 2, "task_timeout_s": 7200,
   "container_memory": "8g", "container_cpus": "2",

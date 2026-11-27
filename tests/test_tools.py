@@ -49,8 +49,6 @@ def indexed(tmp_path, monkeypatch):
         return [(*row, None) for row in rows]
 
     monkeypatch.setattr(tools.index_search, "hybrid_search_ranked", fake_hybrid)
-    monkeypatch.setattr(tools.index_search, "default_reranker", lambda: None)
-    monkeypatch.setattr(policy, "RERANK", False)
     return ctx
 
 

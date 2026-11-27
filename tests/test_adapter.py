@@ -87,7 +87,27 @@ def test_score_folds_exact_match_tokens_and_missing(tmp_path, corpus):
     assert extra["parseable_rate"] == 0.5
     assert extra["answered"] == 2 and extra["answered_rate"] == 0.5
     assert extra["missing"] == 2 and extra["missing_rate"] == 0.5
+    assert extra["rerank_calls"] == 0
+    assert extra["rerank_fallbacks"] == 0
+    assert extra["rerank_fallback_rate"] == 0.0
     assert extra["guard_violations"] == []
+
+
+def test_score_records_the_rerank_fallback_rate(tmp_path, corpus):
+    runs = tmp_path / "runs"
+    out = runs / "jobs" / "base" / "s0" / "Finance & Economics__q_0001"
+    out.mkdir(parents=True)
+    (out / "trajectory.json").write_text(json.dumps({
+        "status": "ok", "answered": True, "usage": {"total_tokens": 1},
+        "retrieval": {"rerank_calls": 4, "rerank_fallbacks": 1}}))
+    (out / "answer.txt").write_text("10.37 pp\n")
+
+    _, extra = DOMAIN.score(runs, "base", ["Finance & Economics/q_0001"], 1)
+
+    assert extra["rerank_calls"] == 4
+    assert extra["rerank_fallbacks"] == 1
+    assert extra["rerank_fallback_rate"] == 0.25
+    assert extra["rerank_fallback_trials"] == 1
 
 
 def test_answered_field_wins_over_the_answer_file():
@@ -182,6 +202,38 @@ def test_guard_scan_rejects_a_reranker_endpoint_override(tmp_path):
 
     hits = ADAPTER._scan_harness(tmp_path)
     assert any("reranker endpoint override" in hit for hit in hits)
+
+
+def test_guard_scan_rejects_a_rerank_switch(tmp_path):
+    harness = tmp_path / "domains" / "agora" / "harness"
+    harness.mkdir(parents=True)
+    (harness / "policy.py").write_text("RERANK = False\n", encoding="utf-8")
+
+    hits = ADAPTER._scan_harness(tmp_path)
+    assert any("rerank switch" in hit for hit in hits)
+
+
+def test_guard_scan_rejects_a_reranker_bypass(tmp_path):
+    harness = tmp_path / "domains" / "agora" / "harness"
+    harness.mkdir(parents=True)
+    (harness / "tools.py").write_text(
+        "hits = index_search.hybrid_ranked(con, q, vector, reranker=None)\n",
+        encoding="utf-8")
+
+    hits = ADAPTER._scan_harness(tmp_path)
+    assert any("reranker override" in hit for hit in hits)
+    assert any("rerank bypass" in hit for hit in hits)
+
+
+def test_rerank_pin_is_outside_the_harness(monkeypatch):
+    assert ADAPTER.CFG["rerank"] is True
+    assert ADAPTER.RERANK is True
+    assert ADAPTER.RERANK_ENV == "AGORA_RERANK=1"
+
+    # A host value must not override the pin: the adapter sets its own env.
+    monkeypatch.setenv("AGORA_RERANK", "0")
+    assert not any(arg.startswith("AGORA_RERANK=")
+                   for arg in ADAPTER._env_args())
 
 
 def test_env_args_forward_the_reranker_endpoint(monkeypatch):

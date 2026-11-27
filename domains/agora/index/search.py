@@ -13,6 +13,10 @@ default and can match the tool's depth with ``--k``.
 An optional cross-encoder reranker takes the RRF top-50 down to ``k``. The
 reranker is a separate GPU service (``rerank.py``), so this module stays
 importable in the CPU sandbox and the fusion path is unchanged when it is off.
+The tool-facing ``hybrid_search_ranked`` resolves the pinned reranker and, when
+the service fails, returns the RRF order and records the fallback. Gate 2 calls
+``hybrid_ranked`` directly and stays strict, so a dead service cannot make a
+``hybrid+rerank`` report look like a clean reranked run.
 
 The final result set is not just the top ``k``: at most ``PER_DOCUMENT`` chunks
 come from one document, and a best rerank score below ``MIN_RERANK_SCORE``
@@ -49,6 +53,40 @@ STOP = frozenset(
 
 Hit = tuple[int, str, int, int]  # chunk_id, doc_path, line_start, line_end
 Ranked = tuple[Hit, float | None]  # hit and rerank score; None when reranking is off
+
+MAX_ERROR_CHARS = 300
+RETRIEVAL_STATS: dict[str, object] = {
+    "rerank_enabled": rerank.enabled(),
+    "rerank_calls": 0,
+    "rerank_fallbacks": 0,
+    "rerank_fallback": False,
+    "last_rerank_error": None,
+}
+
+
+def reset_retrieval_stats() -> None:
+    """Start an episode with a closed circuit and empty counters."""
+    RETRIEVAL_STATS.update({
+        "rerank_enabled": rerank.enabled(),
+        "rerank_calls": 0,
+        "rerank_fallbacks": 0,
+        "rerank_fallback": False,
+        "last_rerank_error": None,
+    })
+    rerank.reset_breaker()
+
+
+def retrieval_stats() -> dict:
+    """A copy of the counters for the trajectory and the run log."""
+    return dict(RETRIEVAL_STATS)
+
+
+def _record_fallback(exc: Exception) -> None:
+    message = f"{type(exc).__name__}: {exc}"[:MAX_ERROR_CHARS]
+    RETRIEVAL_STATS["rerank_fallbacks"] = int(
+        RETRIEVAL_STATS["rerank_fallbacks"]) + 1
+    RETRIEVAL_STATS["rerank_fallback"] = True
+    RETRIEVAL_STATS["last_rerank_error"] = message
 
 
 def match_expression(text: str) -> str:
@@ -186,7 +224,8 @@ def hybrid_ranked(con: sqlite3.Connection, query: str,
                   vector: Sequence[float], k: int = K, depth: int = DEPTH,
                   reranker: rerank.Reranker | None = None,
                   per_document: int | None = PER_DOCUMENT,
-                  min_score: float | None = MIN_RERANK_SCORE) -> list[Ranked]:
+                  min_score: float | None = MIN_RERANK_SCORE,
+                  fallback_on_error: bool = False) -> list[Ranked]:
     """BM25 top-``depth`` + dense top-``depth`` -> RRF -> ranked top-``k``.
 
     The RRF top-``RERANK_DEPTH`` is the candidate pool. With a ``reranker``,
@@ -195,7 +234,9 @@ def hybrid_ranked(con: sqlite3.Connection, query: str,
     no hits. ``per_document`` caps near-duplicate chunks from one file.
 
     Without a reranker, every score is ``None`` and ``min_score`` does not
-    apply; the RRF order is the ranking.
+    apply; the RRF order is the ranking. With ``fallback_on_error``, a failed
+    reranker also returns the RRF order and records the fallback. The tool sets
+    it; Gate 2 leaves it false so a dead service fails loudly.
     """
     fused = reciprocal_rank_fusion(
         [bm25_chunks(con, query, depth), dense_chunks(con, vector, depth)],
@@ -205,7 +246,14 @@ def hybrid_ranked(con: sqlite3.Connection, query: str,
     if reranker is None:
         ranked: list[Ranked] = [(hit, None) for hit in fused]
     else:
-        scores = reranker.score(query, _chunk_texts(con, [hit[0] for hit in fused]))
+        try:
+            scores = reranker.score(
+                query, _chunk_texts(con, [hit[0] for hit in fused]))
+        except Exception as exc:
+            if not fallback_on_error:
+                raise
+            _record_fallback(exc)
+            return _diversify([(hit, None) for hit in fused], k, per_document)
         ranked = sorted(zip(fused, scores), key=lambda item: -item[1])
         if min_score is not None and ranked[0][1] < min_score:
             return []
@@ -243,7 +291,7 @@ def hybrid_search(con: sqlite3.Connection, query: str, k: int = K, *,
                   per_document: int | None = PER_DOCUMENT,
                   min_score: float | None = MIN_RERANK_SCORE
                   ) -> list[tuple[str, int, int]]:
-    """Hybrid path used by both Gate 2 and the agent's search_docs."""
+    """Hit-only path that resolves the pin and uses the RRF fallback."""
     return [(doc_path, line_start, line_end)
             for doc_path, line_start, line_end, _
             in hybrid_search_ranked(con, query, k, depth=depth, encoder=encoder,
@@ -258,12 +306,23 @@ def hybrid_search_ranked(con: sqlite3.Connection, query: str, k: int = K, *,
                          per_document: int | None = PER_DOCUMENT,
                          min_score: float | None = MIN_RERANK_SCORE
                          ) -> list[tuple[str, int, int, float | None]]:
-    """Hybrid path with the rerank score kept for the tool's confidence label."""
+    """Hybrid path with the rerank score kept for the tool's confidence label.
+
+    The pinned switch is resolved here, not in the harness. A candidate that
+    passes ``reranker=None`` therefore cannot disable it. A failed reranker
+    returns the RRF order and increments the fallback counters.
+    """
+    if reranker is None:
+        reranker = rerank.pinned_reranker()
+    if reranker is not None:
+        RETRIEVAL_STATS["rerank_calls"] = int(
+            RETRIEVAL_STATS["rerank_calls"]) + 1
     vector = (encoder or _query_encoder())(query)
     return [(hit[1], hit[2], hit[3], score)
             for hit, score
-            in hybrid_ranked(con, query, vector, k, depth, reranker,
-                             per_document, min_score)]
+            in hybrid_ranked(con, query, vector, k, depth, reranker=reranker,
+                             per_document=per_document, min_score=min_score,
+                             fallback_on_error=True)]
 
 
 def search(con: sqlite3.Connection, query: str, k: int = K) -> list[tuple[str, int, int]]:

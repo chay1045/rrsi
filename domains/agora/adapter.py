@@ -42,6 +42,11 @@ The container is non-root, read-only, without capabilities, with a tmpfs
 the host loopback; the harness has no network tool, and guards reject network
 imports and URLs in harness code. This is a filesystem and process sandbox,
 not a network sandbox; see ``docs/sandbox.md`` in the umbrella repository.
+
+The reranker pin is ``rrsi.json["rerank"]``. The adapter passes it as
+``AGORA_RERANK`` in every episode, so the evolved harness cannot change it. A
+dead service falls back to the RRF order and the trajectory records the
+fallback.
 """
 
 from __future__ import annotations
@@ -69,6 +74,10 @@ import split as agora_split              # noqa: E402
 import tasks as agora_tasks              # noqa: E402
 
 CFG = json.loads((HERE / "rrsi.json").read_text())
+# Per-run pin outside the evolved harness. The adapter always passes it into the
+# container, so a host environment variable cannot flip it.
+RERANK = bool(CFG["rerank"])
+RERANK_ENV = f"AGORA_RERANK={'1' if RERANK else '0'}"
 DATA_DIR = Path(os.environ.get("AGORA_DATA", Path.home() / "work" / "agora-data"))
 INDEX_DIR = Path(os.environ.get("AGORA_INDEX") or (
     Path(os.environ.get("RRSI_CACHE_DIR", Path.home() / ".cache" / "rrsi"))
@@ -93,6 +102,9 @@ _GUARD_PATTERNS = [
     (re.compile(r"\bAGORA_INDEX\b"), "index path override"),
     (re.compile(r"\bAGORA_EMBEDDER\b"), "embedder path override"),
     (re.compile(r"\bAGORA_RERANK[A-Z_]*\b"), "reranker endpoint override"),
+    (re.compile(r"\bRERANK\b"), "rerank switch"),
+    (re.compile(r"\breranker\s*="), "reranker override"),
+    (re.compile(r"\bhybrid_ranked\s*\("), "rerank bypass"),
     (re.compile(r"(?<![\w])/out(?:/|\b)"), "grader output path"),
     (re.compile(r"\banswer\.txt\b"), "grader answer file"),
     (re.compile(r"\btrajectory\.json\b"), "grader trajectory file"),
@@ -333,6 +345,7 @@ class AgoraDomain(Domain):
             {"image": image, "image_id": image_id,
              "max_concurrent": MAX_CONCURRENT,
              "task_timeout_s": TASK_TIMEOUT_S,
+             "rerank": RERANK,
              "violations": violations}, indent=1), encoding="utf-8")
         if violations:
             _log(log_path, f"{log_prefix}{job}: harness guard violations: "
@@ -429,6 +442,7 @@ class AgoraDomain(Domain):
             "--env", "HOME=/tmp",
             "--env", "TMPDIR=/tmp",
             *_env_args(),
+            "--env", RERANK_ENV,
             "--workdir", "/app/agora",
             image, "python", "/app/agora/cli.py",
             "--task", task_id, "--out", "/out", "--trial", str(trial),
@@ -461,6 +475,7 @@ class AgoraDomain(Domain):
         violations = guard.get("violations") or []
         per: dict[str, TaskResult] = {}
         exact = parseable = answered_total = missing_total = trials = 0
+        rerank_calls = rerank_fallbacks = rerank_fallback_trials = 0
 
         for task_id in ids:
             rewards, tokens = [], []
@@ -489,6 +504,15 @@ class AgoraDomain(Domain):
                 if not answered:
                     missing += 1
                     missing_total += 1
+                retrieval = (trajectory or {}).get("retrieval") or {}
+                if isinstance(retrieval, dict):
+                    calls = retrieval.get("rerank_calls")
+                    fallbacks = retrieval.get("rerank_fallbacks")
+                    if isinstance(calls, int) and not isinstance(calls, bool):
+                        rerank_calls += calls
+                    if isinstance(fallbacks, int) and not isinstance(fallbacks, bool):
+                        rerank_fallbacks += fallbacks
+                        rerank_fallback_trials += int(fallbacks > 0)
             per[task_id] = TaskResult(rewards=rewards, tokens=tokens,
                                       missing=missing)
 
@@ -503,6 +527,11 @@ class AgoraDomain(Domain):
             "answered_rate": answered_total / denominator,
             "missing": missing_total,
             "missing_rate": missing_total / denominator,
+            "rerank_calls": rerank_calls,
+            "rerank_fallbacks": rerank_fallbacks,
+            "rerank_fallback_rate": (rerank_fallbacks / rerank_calls
+                                     if rerank_calls else 0.0),
+            "rerank_fallback_trials": rerank_fallback_trials,
             "guard_violations": list(violations),
         }
 
@@ -549,6 +578,7 @@ class AgoraDomain(Domain):
         trajectory = rec.get("trajectory") or {}
         messages = trajectory.get("messages") or []
         usage = trajectory.get("usage") or {}
+        retrieval = trajectory.get("retrieval") or {}
         caps = ({"tool": 4000, "args": 1200, "assistant": 4000} if detail
                 else {"tool": 700, "args": 400, "assistant": 1200})
         lines = [
@@ -560,6 +590,9 @@ class AgoraDomain(Domain):
             f"{trajectory.get('retries')} | turns: "
             f"{trajectory.get('turns')} | total_tokens: "
             f"{usage.get('total_tokens')} | error: {trajectory.get('error')}",
+            f"RETRIEVAL: rerank fallbacks "
+            f"{retrieval.get('rerank_fallbacks') or 0}/"
+            f"{retrieval.get('rerank_calls') or 0}",
             "", "=== TRAJECTORY ===",
         ]
         call_names = {}
@@ -671,6 +704,9 @@ def _build_critic_patterns() -> list:
         (r"(?i)\bAGORA_INDEX\b", "index path override in diff"),
         (r"(?i)\bAGORA_EMBEDDER\b", "embedder path override in diff"),
         (r"(?i)\bAGORA_RERANK[A-Z_]*\b", "reranker endpoint override in diff"),
+        (r"\bRERANK\b", "rerank switch in diff"),
+        (r"\breranker\s*=", "reranker override in diff"),
+        (r"\bhybrid_ranked\s*\(", "rerank bypass in diff"),
         (r"(?<![\w])/out(?:/|\b)", "grader output path in diff"),
         (r"(?i)\banswer\.txt\b", "grader answer file in diff"),
         (r"(?i)\btrajectory\.json\b", "grader trajectory file in diff"),

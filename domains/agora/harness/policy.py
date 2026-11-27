@@ -18,11 +18,6 @@ K = 5                    # search_docs default hits per call. Ten hits double
                          # that needs breadth asks for up to MAX_K.
 MAX_K = 10               # search_docs hard cap, equal to Gate 2's top-10 and
                          # the reranker output. The tool spec advertises it.
-RERANK = True            # cross-encoder rescoring of the RRF top-50. Gate 2
-                         # (issue #15): file recall +0.036, 95% CI [+0.006,
-                         # +0.066]; region +0.102; MRR +0.109. Costs ~1.0 s per
-                         # search, about 30 s per base14 episode. Requires
-                         # scripts/serve_rerank.sh; set False for RRF only.
 MAX_TURNS = 150          # model calls per episode. The cloud 100-turn smoke took
                          # 308 s, so 150 (~8 min) fits the 7200 s task timeout.
                          # The local 100-turn H0 is recorded at 42cfea4; the

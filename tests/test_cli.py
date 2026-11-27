@@ -52,6 +52,8 @@ def test_writes_both_files_and_sums_usage(tmp_path):
     assert trajectory["trial"] == 2
     assert trajectory["turns"] == 2
     assert trajectory["usage"]["total_tokens"] == 12  # 7 + 5, as reported
+    assert trajectory["retrieval"]["rerank_calls"] == 0
+    assert trajectory["retrieval"]["rerank_fallbacks"] == 0
     assert [c["name"] for c in trajectory["tool_calls"]] == ["search_docs", "answer"]
     assert trajectory["tool_calls"][1]["output"] == "episode finished"
     assert [m["role"] for m in trajectory["messages"]][:2] == ["system", "user"]
