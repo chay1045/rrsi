@@ -171,6 +171,14 @@ def test_every_flush_starts_the_next_chunk_with_the_tail():
     assert ch[1].line_start <= ch[0].line_end
 
 
+def test_long_breadcrumb_keeps_the_deepest_section():
+    capped = build.breadcrumb("Doc", "x" * 500, "Deepest")
+
+    assert len(capped) == build.BREADCRUMB_CHARS
+    assert capped.endswith("Deepest")
+    assert build.breadcrumb("Doc", "Section") == "Doc > Section"
+
+
 @pytest.mark.skipif(not TOKENIZER.is_file(), reason="embedder tokenizer not installed")
 def test_dense_numeric_table_is_split_by_real_tokens():
     tokenizer = build.EmbeddingGemmaTokenizer()
@@ -183,6 +191,13 @@ def test_dense_numeric_table_is_split_by_real_tokens():
     pieces = list(build._fit(build.Unit("Table", 1, 1, dense), tokenizer))
     assert len(pieces) > 1
     assert all(build.n_tokens(p.text, tokenizer) <= build.MAX_TOK for p in pieces)
+
+    # A capped breadcrumb plus a full chunk still fits the window.
+    title = build.breadcrumb("Doc", "x" * 500, "Table")
+    ch = build.chunks([build.Unit(title, 1, 1, dense)], tokenizer)
+    assert all(build.n_tokens(build.document_text(c.heading_path, c.text),
+                              tokenizer) <= build.EMBED_MAX_TOKENS
+               for c in ch)
 
 
 def test_build_rejects_a_chunk_over_the_embedder_window(tmp_path, monkeypatch):

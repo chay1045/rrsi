@@ -47,7 +47,8 @@ INDEX_DIR = (
 
 MIN_TOK, MAX_TOK, OVERLAP_TOK = 512, 800, 80
 STRAY_TOK = 32  # footer/page-number leftovers, folded into a neighbour chunk
-CHUNKER_VERSION = 2  # v1 used the 4-chars/token estimate and single-unit overlap
+BREADCRUMB_CHARS = 200  # embedding title cap; long filenames would starve the text
+CHUNKER_VERSION = 3  # v1 4-chars estimate; v2 real tokens; v3 capped breadcrumb
 SUFFIXES = {".md": "md", ".xlsx": "xlsx", ".csv": "csv"}
 HEADING = re.compile(r"^(#{1,6})\s+(\S.*?)\s*$")
 CJK = re.compile(r"[\u2e80-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]")
@@ -120,6 +121,19 @@ def cjk_split(text: str) -> str:
     return " ".join(CJK.findall(text))
 
 
+def breadcrumb(*parts: str) -> str:
+    """Join a title and its headings, keeping the deepest 200 characters.
+
+    Some filenames are longer than a chunk. The title is also the embedding
+    prefix, so an uncapped path can eat the whole 1024-token window. Keep the
+    tail: the section heading matters more than the file name.
+    """
+    text = " > ".join(parts)
+    if len(text) <= BREADCRUMB_CHARS:
+        return text
+    return "…" + text[-(BREADCRUMB_CHARS - 1):]
+
+
 def _md_units(text: str, title: str) -> Iterator[Unit]:
     """Split markdown on headings and blank lines; each unit keeps a breadcrumb."""
     lines = text.splitlines()
@@ -128,7 +142,7 @@ def _md_units(text: str, title: str) -> Iterator[Unit]:
     start = 0
 
     def crumbs() -> str:
-        return " > ".join([title, *(heading for _, heading in path)])
+        return breadcrumb(title, *(heading for _, heading in path))
 
     def take(end: int) -> Unit | None:
         nonlocal block
@@ -162,7 +176,8 @@ def _row(heading_path: str, line: int, cells: list[tuple[str, object]]) -> Unit 
               if value is not None and str(value).strip()]
     if not values:
         return None
-    return Unit(heading_path, line, line, " | ".join(f"{col}: {v}" for col, v in values))
+    return Unit(breadcrumb(heading_path), line, line,
+                " | ".join(f"{col}: {v}" for col, v in values))
 
 
 def _csv_units(path: Path) -> Iterator[Unit]:
