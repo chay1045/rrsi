@@ -13,9 +13,11 @@ Two invariants keep the split valid:
 * a cut never lands on a tool result. The tail starts at an assistant message,
   so an assistant ``tool_calls`` message and its results stay together.
 
-``usage.prompt_tokens`` is the primary count. Chars are only the fallback for
-text the endpoint has not seen yet; the ratio is calibrated from the last
-reported usage, because this corpus measures 2.3-2.6 chars/token, not 4.
+``usage.prompt_tokens`` is the primary count. The caller can inject an exact
+prompt counter (vLLM ``/tokenize``); it drives the trigger and the summary
+input limit. Chars remain the fallback for endpoints without that counter; the
+ratio is calibrated from the last reported usage, because this corpus measures
+2.3-2.6 chars/token, not 4.
 """
 
 from __future__ import annotations
@@ -144,6 +146,12 @@ def previous_summary(older: list[dict]) -> str | None:
 def summary_message(text: str) -> dict:
     return {"role": "user",
             "content": f"{SUMMARY_PREFIX}\n<summary>\n{text.strip()}\n</summary>"}
+
+
+def summary_messages(request: str) -> list[dict]:
+    """The exact message list the summarization call sends."""
+    return [{"role": "system", "content": prompts.SUMMARY_SYSTEM},
+            {"role": "user", "content": request}]
 
 
 def render_transcript(messages: list[dict]) -> str:

@@ -57,6 +57,108 @@ def test_writes_both_files_and_sums_usage(tmp_path):
     assert [m["role"] for m in trajectory["messages"]][:2] == ["system", "user"]
 
 
+def test_usage_reaches_the_graph_and_stays_out_of_messages(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_run(task, client, ctx, summarize=None, notes=None, count=None):
+        reply = client([{"role": "user", "content": "q"}], [], force=None)
+        seen["reply"] = reply
+        seen["count"] = count
+        return {"messages": [reply], "turns": 1, "answer": "10.37 pp",
+                "usage": {"total_tokens": 5, "cached_tokens": 2},
+                "compactions": [], "summary_usage": {},
+                "token_drift": [{"turn": 1, "predicted": 1,
+                                  "actual": 1, "ratio": 0.0}]}
+
+    monkeypatch.setattr(cli.graph, "run", fake_run)
+
+    def marker(messages, specs=None):
+        return 1
+
+    trajectory = cli.run_task(
+        TASK, tmp_path, ctx=CTX, count=marker,
+        client=scripted({**call("answer", {"value": "10.37 pp"}),
+                         "usage": {"total_tokens": 5,
+                                   "prompt_tokens_details": {
+                                       "cached_tokens": 2}}}))
+
+    assert seen["reply"]["usage"]["total_tokens"] == 5
+    assert seen["count"] is marker
+    assert trajectory["usage"] == {"total_tokens": 5, "cached_tokens": 2}
+    assert trajectory["token_drift"] == [{"turn": 1, "predicted": 1,
+                                         "actual": 1, "ratio": 0.0}]
+    assert all("usage" not in message for message in trajectory["messages"])
+
+
+def test_tokenize_url_strips_the_v1_prefix():
+    assert cli._tokenize_url("http://127.0.0.1:8000/v1") == (
+        "http://127.0.0.1:8000/tokenize")
+    assert cli._tokenize_url("http://127.0.0.1:8000/v1/") == (
+        "http://127.0.0.1:8000/tokenize")
+    assert cli._tokenize_url("http://127.0.0.1:8000") == (
+        "http://127.0.0.1:8000/tokenize")
+
+
+def test_token_counter_posts_the_chat_prompt(monkeypatch):
+    seen = {}
+
+    def fake_post(url, body):
+        seen.update(url=url, body=body)
+        return {"count": 321}
+
+    monkeypatch.setattr(cli, "_post_json", fake_post)
+    messages = [{"role": "user", "content": "q"}]
+    specs = [{"type": "function", "function": {"name": "grep"}}]
+
+    count = cli._token_counter("http://box:8000/v1", "inkling")
+
+    assert count(messages, specs) == 321
+    assert seen == {
+        "url": "http://box:8000/tokenize",
+        "body": {"model": "inkling", "messages": messages,
+                 "add_generation_prompt": True, "tools": specs}}
+
+
+def test_token_counter_normalizes_none_assistant_content(monkeypatch):
+    seen = {}
+
+    def fake_post(url, body):
+        seen["body"] = body
+        return {"count": 12}
+
+    monkeypatch.setattr(cli, "_post_json", fake_post)
+    messages = [{"role": "assistant", "content": None, "tool_calls": [
+        {"id": "c1", "type": "function",
+         "function": {"name": "grep", "arguments": "{}"}}]}]
+
+    assert cli._token_counter("http://box:8000/v1", "inkling")(
+        messages) == 12
+    # vLLM's /tokenize drops a None-content tool call; "" matches the chat route.
+    assert seen["body"]["messages"][0]["content"] == ""
+    assert messages[0]["content"] is None
+
+    # A plain empty assistant message is not a tool call: leave it as None.
+    cli._token_counter("http://box:8000/v1", "inkling")(
+        [{"role": "assistant", "content": None}])
+    assert seen["body"]["messages"][0]["content"] is None
+
+
+def test_token_counter_disables_after_one_failure(monkeypatch, capsys):
+    calls = []
+
+    def fake_post(url, body):
+        calls.append(url)
+        raise OSError("no /tokenize")
+
+    monkeypatch.setattr(cli, "_post_json", fake_post)
+    count = cli._token_counter("http://box:8000/v1", "inkling")
+
+    assert count([{"role": "user", "content": "q"}]) is None
+    assert count([{"role": "user", "content": "q"}]) is None
+    assert len(calls) == 1
+    assert "chars fallback" in capsys.readouterr().err
+
+
 def test_existing_answer_is_skipped(tmp_path):
     (tmp_path / "answer.txt").write_text("10.37 pp\n")
 

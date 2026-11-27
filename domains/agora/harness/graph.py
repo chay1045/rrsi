@@ -46,6 +46,7 @@ class State(TypedDict, total=False):
     anchor: dict | None
     compactions: list[dict]
     summary_usage: dict
+    token_drift: list[dict]
 
 
 def _tool_message(call: dict, content: str) -> dict:
@@ -101,7 +102,7 @@ def _last_text(messages: list[dict]) -> str:
     return ""
 
 
-def _sum_usage(target: dict, usage: dict | None) -> dict:
+def sum_usage(target: dict, usage: dict | None) -> dict:
     """Add one usage report to ``target``; keep the nested cache count flat."""
     for key, value in (usage or {}).items():
         if isinstance(value, (int, float)):
@@ -114,7 +115,21 @@ def _sum_usage(target: dict, usage: dict | None) -> dict:
 
 
 def _add_usage(usage: dict, reply: dict) -> dict:
-    return _sum_usage(dict(usage or {}), reply.pop("usage", None))
+    return sum_usage(dict(usage or {}), reply.pop("usage", None))
+
+
+def _exact_tokens(count, messages: list[dict],
+                  specs: list[dict] | None = None) -> int | None:
+    """The injected exact counter, or None when it is absent or fails."""
+    if count is None:
+        return None
+    try:
+        tokens = count(messages, specs)
+    except Exception:  # a counter failure must not end the episode
+        return None
+    if isinstance(tokens, int) and tokens > 0:
+        return tokens
+    return None
 
 
 def _anchor(messages: list[dict], specs: list[dict], usage: dict | None) -> dict | None:
@@ -132,33 +147,38 @@ def _final_phase(state: State) -> bool:
 
 
 def build(client=None, ctx: tools.Context | None = None, summarize=None,
-          notes=None):
+          notes=None, count=None):
     """Compile the graph. ``client`` is only needed when it is invoked.
 
     ``summarize(request) -> {"content": str, "usage": dict, "truncated": bool}``
     is optional. Without it, the older part is dropped deterministically when
     the budget is crossed, so tests and offline runs never need an endpoint.
     ``notes`` is an optional callable that returns notes.md for the summary.
+    ``count(messages, specs) -> int | None`` is an optional exact prompt counter.
+    When it returns None, the chars estimate is the fallback.
 
     ``run()`` sets the recursion limit to match MAX_TURNS; a direct ``invoke``
     keeps LangGraph's default and would stop after ~12 turns.
     """
 
     def _maybe_compact(state: State, messages: list[dict],
-                       specs: list[dict]) -> tuple[list[dict], dict]:
+                       specs: list[dict]) -> tuple[list[dict], dict, int | None]:
         """Replace the older part with a summary when the prompt is over budget."""
         anchor = state.get("anchor")
-        before = context.estimate(messages, specs, anchor)
+        counted = _exact_tokens(count, messages, specs)
+        before = (counted if counted is not None
+                  else context.estimate(messages, specs, anchor))
         if before <= policy.CONTEXT_TOKENS:
-            return messages, {}
+            return messages, {}, counted
         cut = context.cut_point(messages, policy.KEEP_RECENT_TOKENS,
                                 context.chars_per_token(anchor))
         if cut is None:
-            return messages, {}
+            return messages, {}, counted
         head, older, tail = context.split(messages, cut)
         if not older:
-            return messages, {}
+            return messages, {}, counted
         event = {"turn": state["turns"] + 1, "before_tokens": before,
+                 "before_exact": counted is not None,
                  "dropped_messages": len(older)}
         update: dict = {}
         text, summary_usage, error = "", {}, None
@@ -173,32 +193,41 @@ def build(client=None, ctx: tools.Context | None = None, summarize=None,
                 body = [message for message in older
                         if not context.is_summary(message)]
                 notes_text = notes() if notes is not None else None
-                # The summary request must itself fit: its input plus the
-                # output cap and a small reserve. A turn that adds several
-                # large tool results can overshoot the agent trigger, so drop
-                # the oldest blocks from the summary input if needed. The
-                # dropped turns are recorded; the previous summary still covers
-                # them when one exists.
-                ratio = context.chars_per_token(anchor)
-                # The summary prompt has a different mix from the agent prompt,
-                # so keep a 10% char margin plus 4k tokens for the system
-                # message and template. Overrunning this would reject the one
-                # call that is supposed to save the episode.
-                limit = int((policy.CONTEXT_WINDOW - policy.SUMMARY_MAX_TOKENS
-                             - 4096) * ratio * 0.9)
+                # The summary request must itself fit: its exact prompt plus
+                # the output cap and the 4k-token template reserve. A turn that
+                # adds several large tool results can overshoot the agent
+                # trigger, so drop the oldest blocks from the summary input if
+                # needed. The dropped turns are recorded; the previous summary
+                # still covers them when one exists.
+                token_limit = (policy.CONTEXT_WINDOW
+                               - policy.SUMMARY_MAX_TOKENS - 4096)
+                # The chars path has a different mix from the agent prompt, so
+                # keep a 10% margin. Overrunning this would reject the one call
+                # that is supposed to save the episode.
+                char_limit = int(token_limit
+                                 * context.chars_per_token(anchor) * 0.9)
                 dropped = 0
-                request = context.summary_request(
-                    task, context.render_transcript(body), previous, notes_text)
-                while len(request) > limit and body:
+                summary_tokens = None
+                summary_exact = False
+                while True:
+                    request = context.summary_request(
+                        task, context.render_transcript(body), previous,
+                        notes_text)
+                    summary_tokens = _exact_tokens(
+                        count, context.summary_messages(request))
+                    summary_exact = summary_tokens is not None
+                    over = (summary_tokens > token_limit if summary_exact
+                            else len(request) > char_limit)
+                    if not over or not body:
+                        break
                     trimmed = context.drop_oldest_block(body)
                     if len(trimmed) == len(body):
                         break
                     dropped += len(body) - len(trimmed)
                     body = trimmed
-                    request = context.summary_request(
-                        task, context.render_transcript(body), previous,
-                        notes_text)
                 event["dropped_unsummarized"] = dropped
+                event["summary_prompt_tokens"] = summary_tokens
+                event["summary_exact"] = summary_exact
                 result = summarize(request)
                 if isinstance(result, str):
                     result = {"content": result}
@@ -220,13 +249,16 @@ def build(client=None, ctx: tools.Context | None = None, summarize=None,
             event["summary_chars"] = len(text)
             event["summary"] = text
             event["fallback"] = False
-        event["after_tokens"] = context.estimate(messages, specs, None)
+        after = _exact_tokens(count, messages, specs)
+        event["after_tokens"] = (after if after is not None
+                                 else context.estimate(messages, specs, None))
+        event["after_exact"] = after is not None
         update["anchor"] = None
         update["compactions"] = list(state.get("compactions") or []) + [event]
         if summary_usage:
-            update["summary_usage"] = _sum_usage(
+            update["summary_usage"] = sum_usage(
                 dict(state.get("summary_usage") or {}), summary_usage)
-        return messages, update
+        return messages, update, after
 
     def agent(state: State) -> dict:
         if client is None:
@@ -254,16 +286,27 @@ def build(client=None, ctx: tools.Context | None = None, summarize=None,
             if repeat:
                 nudge = repeat
                 update["repeat_nudged"] = state["recent_calls"][-1]
-        messages, compacted = _maybe_compact(state, messages, specs)
-        update.update(compacted)
         if nudge:
             messages = messages + [{"role": "user", "content": nudge}]
+        messages, compacted, predicted = _maybe_compact(state, messages, specs)
+        update.update(compacted)
         reply = dict(client(messages, specs, force=force))
         update["messages"] = messages + [reply]
-        anchor = _anchor(messages, specs, reply.get("usage"))
+        usage = reply.get("usage")
+        anchor = _anchor(messages, specs, usage)
         if anchor:
             update["anchor"] = anchor
-        if reply.get("usage"):
+        if isinstance(usage, dict):
+            actual = usage.get("prompt_tokens")
+            if (predicted is not None and isinstance(actual, (int, float))
+                    and actual > 0):
+                update["token_drift"] = list(
+                    state.get("token_drift") or []) + [{
+                        "turn": update["turns"],
+                        "predicted": predicted,
+                        "actual": int(actual),
+                        "ratio": round(abs(predicted - actual) / actual, 5)}]
+        if usage:
             update["usage"] = _add_usage(state.get("usage"), reply)
         return update
 
@@ -334,14 +377,15 @@ def build(client=None, ctx: tools.Context | None = None, summarize=None,
     return graph.compile()
 
 
-def run(task: str, client, ctx: tools.Context, summarize=None, notes=None) -> dict:
+def run(task: str, client, ctx: tools.Context, summarize=None, notes=None,
+        count=None) -> dict:
     """One episode. Returns the final state plus a never-empty ``answer``."""
-    state = build(client, ctx, summarize, notes).invoke(
+    state = build(client, ctx, summarize, notes, count).invoke(
         {"messages": [{"role": "system", "content": prompts.SYSTEM},
                       {"role": "user", "content": task}],
          "task": task, "turns": 0, "empty_retries": 0, "recent_calls": [],
          "repeat_nudged": None, "anchor": None, "compactions": [],
-         "summary_usage": {}},
+         "summary_usage": {}, "token_drift": []},
         {"recursion_limit": 2 * policy.MAX_TURNS + 5})
     state["answer"] = state.get("answer") or _last_text(state["messages"]) or "UNKNOWN"
     return state

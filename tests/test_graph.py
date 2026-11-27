@@ -98,6 +98,57 @@ def test_usage_is_summed_but_not_sent_back():
     assert all("usage" not in m for m in state["messages"])
 
 
+def test_usage_anchor_survives_the_usage_sum():
+    client = scripted({**call("answer", {"value": "1"}),
+                       "usage": {"total_tokens": 100, "prompt_tokens": 90}})
+    state = graph.run("q", client, CTX)
+
+    assert state["anchor"] == {
+        "chars": context.total_chars(client.calls[0], tools.SPECS),
+        "tokens": 90}
+
+
+def test_exact_count_tracks_the_reported_prompt_tokens():
+    client = scripted({**call("answer", {"value": "1"}),
+                       "usage": {"total_tokens": 110, "prompt_tokens": 102}})
+    state = graph.run("q", client, CTX,
+                      count=lambda messages, specs=None: 101)
+
+    drift = state["token_drift"][0]
+    assert drift == {"turn": 1, "predicted": 101, "actual": 102,
+                     "ratio": 0.0098}
+    assert drift["ratio"] <= 0.01
+    assert state["anchor"]["tokens"] == 102
+
+
+def test_exact_counter_drives_the_compaction_trigger(monkeypatch):
+    monkeypatch.setattr(policy, "MAX_TURNS", 8)
+    monkeypatch.setattr(policy, "FINAL_TURNS", 0)
+    monkeypatch.setattr(policy, "CONTEXT_TOKENS", 100)
+    monkeypatch.setattr(policy, "KEEP_RECENT_TOKENS", 10)
+    monkeypatch.setattr(policy, "CHARS_PER_TOKEN", 1.0)
+    monkeypatch.setattr(tools, "SPECS", [{"type": "function", "function": {
+        "name": "grep", "description": "", "parameters": {}}}])
+    monkeypatch.setattr(tools, "dispatch", lambda name, args, ctx: "x" * 900)
+
+    def count(messages, specs=None):
+        # The exact counter disagrees with the small char estimate.
+        return 1000 if len(messages) >= 6 else 10
+
+    replies = [call("grep", {"pattern": f"q{i}"}, f"c{i}") for i in range(5)]
+    replies.append(call("answer", {"value": "1"}, "c9"))
+    state = graph.run("q", scripted(*replies), CTX, count=count,
+                      summarize=lambda request: {"content": "## Objective\n- q"})
+
+    event = state["compactions"][0]
+    assert event["before_tokens"] == 1000
+    assert event["before_exact"] is True
+    assert event["after_exact"] is True
+    assert event["summary_exact"] is True
+    assert event["summary_prompt_tokens"] == 10
+    assert state["answer"] == "1"
+
+
 def test_answer_on_the_last_allowed_turn_is_captured(monkeypatch):
     monkeypatch.setattr(policy, "MAX_TURNS", 1)
     monkeypatch.setattr(policy, "FINAL_TURNS", 0)
@@ -412,6 +463,9 @@ def test_budget_compacts_older_turns_into_one_summary(monkeypatch):
     assert requests and "x" * 900 in requests[0]
     event = state["compactions"][0]
     assert event["fallback"] is False
+    assert event["before_exact"] is False
+    assert event["after_exact"] is False
+    assert event["summary_exact"] is False
     assert event["dropped_messages"] >= 2
     assert event["before_tokens"] > event["after_tokens"]
     messages = state["messages"]
@@ -447,6 +501,44 @@ def test_summary_input_is_bounded_when_a_turn_overshoots(monkeypatch):
     limit = int((12000 - 2000 - 4096) * 1.0 * 0.9)
     assert requests and all(len(request) <= limit for request in requests)
     assert state["compactions"][0]["dropped_unsummarized"] > 0
+    assert state["answer"] == "1"
+
+
+def test_exact_counter_bounds_the_summary_request(monkeypatch):
+    monkeypatch.setattr(policy, "MAX_TURNS", 16)
+    monkeypatch.setattr(policy, "FINAL_TURNS", 0)
+    monkeypatch.setattr(policy, "CONTEXT_WINDOW", 12000)
+    monkeypatch.setattr(policy, "CONTEXT_TOKENS", 10200)
+    monkeypatch.setattr(policy, "KEEP_RECENT_TOKENS", 500)
+    monkeypatch.setattr(policy, "SUMMARY_MAX_TOKENS", 2000)
+    monkeypatch.setattr(policy, "CHARS_PER_TOKEN", 1.0)
+    monkeypatch.setattr(tools, "SPECS", [{"type": "function", "function": {
+        "name": "grep", "description": "", "parameters": {}}}])
+    monkeypatch.setattr(tools, "dispatch", lambda name, args, ctx: "x" * 900)
+
+    requests = []
+
+    def count(messages, specs=None):
+        if (messages
+                and messages[0].get("content") == graph.prompts.SUMMARY_SYSTEM):
+            return len(messages[1].get("content") or "")
+        return 11000 if len(messages) >= 18 else 10
+
+    def summarize(request):
+        requests.append(request)
+        return {"content": "ok"}
+
+    replies = [call("grep", {"pattern": f"q{i}"}, f"c{i}") for i in range(12)]
+    replies.append(call("answer", {"value": "1"}, "c99"))
+    state = graph.run("q", scripted(*replies), CTX, summarize=summarize,
+                      count=count)
+
+    token_limit = 12000 - 2000 - 4096
+    event = state["compactions"][0]
+    assert requests and all(len(request) <= token_limit for request in requests)
+    assert event["summary_exact"] is True
+    assert event["summary_prompt_tokens"] <= token_limit
+    assert event["dropped_unsummarized"] > 0
     assert state["answer"] == "1"
 
 

@@ -24,9 +24,11 @@ import signal
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
+from urllib.request import Request, urlopen
 
 import tasks
-from harness import graph, policy, prompts, tools
+from harness import context, graph, policy, prompts, tools
 
 MODEL = os.environ.get("AGORA_MODEL", "Inkling-2-Mini")
 LIVE = os.environ.get("AGORA_LIVE") == "1"
@@ -35,6 +37,75 @@ LIVE = os.environ.get("AGORA_LIVE") == "1"
 def _clip(value, limit: int = 800) -> str:
     text = "" if value is None else str(value)
     return text if len(text) <= limit else text[:limit] + f" ...[+{len(text) - limit} chars]"
+
+
+def _tokenize_url(base_url: str) -> str:
+    """The vLLM ``/tokenize`` URL for an OpenAI-compatible base URL."""
+    parts = urlsplit(base_url)
+    path = parts.path.rstrip("/")
+    if path.endswith("/v1"):
+        path = path[:-len("/v1")]
+    return urlunsplit((parts.scheme, parts.netloc, path + "/tokenize", "", ""))
+
+
+def _post_json(url: str, body: dict) -> dict:
+    request = Request(url, data=json.dumps(body).encode("utf-8"),
+                      headers={"Content-Type": "application/json"})
+    # A 262k-token prompt can take a few seconds to render and tokenize.
+    with urlopen(request, timeout=30) as response:
+        return json.load(response)
+
+
+def _countable(messages: list[dict]) -> list[dict]:
+    """Messages as the chat route renders them.
+
+    vLLM's ``/tokenize`` drops an assistant tool-call message whose ``content``
+    is None. The chat route renders the same message with an empty text block,
+    so normalize it here to keep the count exact.
+    """
+    return [({**message, "content": ""}
+             if message.get("role") == "assistant"
+             and message.get("content") is None
+             and message.get("tool_calls") else message)
+            for message in messages]
+
+
+def _token_counter(base_url: str | None = None, model: str | None = None):
+    """Exact prompt count from vLLM ``/tokenize``; None for the chars fallback.
+
+    The endpoint applies the served model's tokenizer and chat template, so the
+    count matches the prompt the chat completion sees. A cloud endpoint without
+    ``/tokenize`` disables the counter after the first failure; the graph then
+    uses the chars estimate for the rest of the episode.
+    """
+    url = _tokenize_url(base_url or os.environ.get(
+        "OPENAI_BASE_URL", "http://127.0.0.1:8000/v1"))
+    name = model or MODEL
+    available = True
+
+    def count(messages: list[dict],
+              specs: list[dict] | None = None) -> int | None:
+        nonlocal available
+        if not available:
+            return None
+        body = {"model": name, "messages": _countable(messages),
+                "add_generation_prompt": True}
+        if specs:
+            body["tools"] = specs
+        try:
+            payload = _post_json(url, body)
+        except Exception as exc:  # unreachable or unsupported endpoint
+            available = False
+            print(f"warning: exact token counter unavailable at {url}: {exc}; "
+                  "using the chars fallback", file=sys.stderr)
+            return None
+        tokens = payload.get("count") if isinstance(payload, dict) else None
+        if isinstance(tokens, int) and tokens > 0:
+            return tokens
+        available = False
+        return None
+
+    return count
 
 
 class _Live:
@@ -83,6 +154,10 @@ class _Live:
                     f"before={f['before_tokens']} after={f['after_tokens']} "
                     f"dropped={f['dropped_messages']} "
                     f"fallback={f['fallback']} error={f.get('error')}")
+        if kind == "token_drift":
+            return (f"[live] DRIFT turn={f['turn']} "
+                    f"predicted={f['predicted']} actual={f['actual']} "
+                    f"ratio={f['ratio']}")
         if kind == "tool_call":
             return (f"[live] TOOL {f['name']} "
                     f"args={_clip(json.dumps(f.get('args'), ensure_ascii=False), 900)}")
@@ -165,9 +240,7 @@ def _summarizer():
 
     def summarize(request: str) -> dict:
         call = {"model": MODEL,
-                "messages": [
-                    {"role": "system", "content": prompts.SUMMARY_SYSTEM},
-                    {"role": "user", "content": request}],
+                "messages": context.summary_messages(request),
                 "temperature": 0.0,
                 "max_tokens": policy.SUMMARY_MAX_TOKENS}
         if effort:
@@ -250,7 +323,7 @@ def _write(path: Path, text: str) -> None:
 
 def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
              ctx: tools.Context | None = None, summarize=None,
-             notes=None) -> dict:
+             notes=None, count=None) -> dict:
     """One episode; always leaves ``trajectory.json`` (unless skipped)."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -270,6 +343,7 @@ def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
     previous_scratch = os.environ.get("AGORA_SCRATCH")
 
     usage: dict = {}
+    usage_reports: list[dict] = []  # the error path has no graph state
     history: list[dict] = []  # the whole episode, unlike the compacted state
     seen: set = set()
     log("run_start", task=task.id, query=task.query, system=prompts.SYSTEM,
@@ -298,18 +372,17 @@ def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
             log("model_error", turn=turn,
                 error=f"{type(exc).__name__}: {exc}")
             raise
+        # Keep usage on the reply: graph._add_usage() reads it for the anchor
+        # and the trajectory total, then removes it from the replayed message.
+        report = reply.get("usage")
+        if isinstance(report, dict) and report:
+            usage_reports.append(dict(report))
         log("model_reply", turn=turn,
             elapsed_s=round(time.monotonic() - request_started, 3),
             content=reply.get("content"), tool_calls=reply.get("tool_calls"),
-            usage=reply.get("usage"))
-        for key, value in (reply.pop("usage", None) or {}).items():
-            if isinstance(value, (int, float)):
-                usage[key] = usage.get(key, 0) + value
-            elif key == "prompt_tokens_details" and isinstance(value, dict):
-                cached = value.get("cached_tokens")
-                if isinstance(cached, (int, float)):
-                    usage["cached_tokens"] = usage.get("cached_tokens", 0) + cached
-        history.append(reply)
+            usage=report)
+        history.append({key: value for key, value in reply.items()
+                        if key != "usage"})
         return reply
 
     original_dispatch = tools.dispatch
@@ -332,24 +405,31 @@ def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
     started = time.monotonic()
     interrupted = None
     compactions: list[dict] = []
+    drift: list[dict] = []
     try:
         state = graph.run(task.query, model, ctx or _context(task),
-                          summarize=summarize, notes=notes)
+                          summarize=summarize, notes=notes, count=count)
         status, error = "ok", None
         turns, answer = state["turns"], state["answer"]
         compactions = state.get("compactions") or []
+        drift = state.get("token_drift") or []
         # The summary call is part of the episode cost, but not a model turn.
-        for key, value in (state.get("summary_usage") or {}).items():
-            if isinstance(value, (int, float)):
-                usage[key] = usage.get(key, 0) + value
+        usage = dict(state.get("usage") or {})
+        graph.sum_usage(usage, state.get("summary_usage") or {})
         for event in compactions:
             log("compaction", **event)
+        for record in drift:
+            log("token_drift", **record)
         # The final act's result never reaches another model call.
         _add_tool_results(history, seen, state["messages"])
     except BaseException as exc:  # Ctrl-C / SIGTERM must still leave a trace
         status, error = "error", f"{type(exc).__name__}: {exc}"
         answer = "UNKNOWN"
         turns = sum(1 for m in history if m.get("role") == "assistant")
+        # The graph state is not available, so sum the replies already seen.
+        usage = {}
+        for report in usage_reports:
+            graph.sum_usage(usage, report)
         log("run_error", error=error)
         if not isinstance(exc, Exception):
             interrupted = exc
@@ -375,6 +455,7 @@ def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
         "wall_time_s": wall_time,
         "usage": usage,
         "compactions": compactions,
+        "token_drift": drift,
         "tool_calls": _tool_calls(history),
         "messages": history,
     }
@@ -407,9 +488,10 @@ def main(argv: list[str] | None = None) -> int:
     # Build the summarizer first: _client() removes OPENAI_API_KEY from the
     # process environment so the python tool cannot read it.
     summarize = _summarizer()
+    count = _token_counter()
     trajectory = run_task(task, args.out, args.trial, client=_client(),
                           ctx=_context(task), summarize=summarize,
-                          notes=_notes)
+                          notes=_notes, count=count)
     print(f"{trajectory['status']}: {task.id} -> {args.out} "
           f"({trajectory['turns']} turns, "
           f"{trajectory['usage']['total_tokens']} tokens)")
