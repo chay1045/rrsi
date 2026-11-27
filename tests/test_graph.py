@@ -30,15 +30,17 @@ def call(name, args, call_id="c1"):
 def scripted(*replies):
     """A client that returns the scripted replies in order."""
     pending = list(replies)
-    calls, specs_seen = [], []
+    calls, specs_seen, forces = [], [], []
 
-    def client(messages, specs):
+    def client(messages, specs, force=None):
         calls.append(messages)
         specs_seen.append(specs)
+        forces.append(force)
         return dict(pending.pop(0))
 
     client.calls = calls
     client.specs = specs_seen
+    client.forces = forces
     return client
 
 
@@ -86,10 +88,13 @@ def test_tool_exception_is_an_error_string(monkeypatch):
 
 
 def test_usage_is_summed_but_not_sent_back():
-    client = scripted({**call("nope", {}), "usage": {"total_tokens": 11}},
-                      {**call("answer", {"value": "3"}), "usage": {"total_tokens": 7}})
+    client = scripted(
+        {**call("nope", {}),
+         "usage": {"total_tokens": 11,
+                   "prompt_tokens_details": {"cached_tokens": 4}}},
+        {**call("answer", {"value": "3"}), "usage": {"total_tokens": 7}})
     state = graph.run("q", client, CTX)
-    assert state["usage"] == {"total_tokens": 18}
+    assert state["usage"] == {"total_tokens": 18, "cached_tokens": 4}
     assert all("usage" not in m for m in state["messages"])
 
 
@@ -230,14 +235,17 @@ def test_repeated_calls_stay_bounded_by_max_turns(monkeypatch):
     assert state["answer"] == "UNKNOWN"
 
 
-def test_final_phase_offers_python_and_answer_and_ends_on_the_submission(monkeypatch):
+def test_final_phase_keeps_the_tool_list_and_restricts_the_choice(monkeypatch):
     monkeypatch.setattr(policy, "MAX_TURNS", 3)
     monkeypatch.setattr(policy, "FINAL_TURNS", 2)
     client = scripted(call("nope", {}, "c1"), call("answer", {"value": "4"}, "c2"))
     state = graph.run("q", client, CTX)
 
-    assert client.specs[1] == tools.FINAL_SPECS
-    assert [s["function"]["name"] for s in client.specs[1]] == ["python", "answer"]
+    # The declaration is rendered before the first message; a changed list would
+    # invalidate the whole prompt cache. tool_choice does the restriction.
+    assert client.specs[0] == tools.SPECS
+    assert client.specs[1] == tools.SPECS
+    assert client.forces[1] == "required"
     assert client.calls[1][-1] == {"role": "user",
                                    "content": policy.FINAL_NUDGE}
     assert state["turns"] == 2
@@ -255,8 +263,8 @@ def test_final_phase_allows_python_on_the_first_final_turn_then_forces_answer(mo
                       call("answer", {"value": "4"}, "c3"))
     state = graph.run("q", client, CTX)
 
-    assert client.specs[1] == tools.FINAL_SPECS
-    assert client.specs[2] == [tools.ANSWER_SPEC]
+    assert client.forces[1] == "required"
+    assert client.forces[2] == "answer"
     assert client.calls[2][-1] == {"role": "user",
                                    "content": policy.FINAL_ANSWER_NUDGE}
     results = [m for m in state["messages"] if m.get("role") == "tool"]
@@ -274,9 +282,10 @@ def test_final_phase_allows_five_python_turns_before_the_forced_answer(monkeypat
     client = scripted(*replies)
     state = graph.run("q", client, CTX)
 
-    assert client.specs[0] == tools.SPECS
-    assert client.specs[1:6] == [tools.FINAL_SPECS] * 5
-    assert client.specs[6] == [tools.ANSWER_SPEC]
+    assert client.specs == [tools.SPECS] * 7
+    assert client.forces[0] is None
+    assert client.forces[1:6] == ["required"] * 5
+    assert client.forces[6] == "answer"
     assert state["turns"] == 7
     assert state["answer"] == "4"
 
@@ -291,8 +300,8 @@ def test_final_phase_appends_the_nudge_once(monkeypatch):
     nudges = [m for m in state["messages"]
               if m.get("content") == policy.FINAL_NUDGE]
     assert len(nudges) == 1
-    assert client.specs[1] == tools.FINAL_SPECS
-    assert client.specs[2] == [tools.ANSWER_SPEC]
+    assert client.forces[1] == "required"
+    assert client.forces[2] == "answer"
     assert client.calls[2][-1] == {"role": "user",
                                    "content": policy.FINAL_ANSWER_NUDGE}
     assert state["turns"] == 3
@@ -305,39 +314,136 @@ def test_final_phase_content_reply_is_the_text_fallback(monkeypatch):
     client = scripted({"role": "assistant", "content": " 42 "})
     state = graph.run("q", client, CTX)
 
-    assert client.specs[0] == tools.FINAL_SPECS
+    assert client.specs[0] == tools.SPECS
+    assert client.forces[0] == "required"
     assert state["turns"] == 1
     assert state["answer"] == "42"
 
 
-def test_final_answer_nudge_revokes_python_and_keeps_the_text_fallback(monkeypatch):
+def test_final_answer_nudge_forces_the_answer_and_keeps_the_text_fallback(monkeypatch):
     monkeypatch.setattr(policy, "MAX_TURNS", 1)
     monkeypatch.setattr(policy, "FINAL_TURNS", 1)
     client = scripted({"role": "assistant", "content": " 42 "})
     state = graph.run("q", client, CTX)
 
-    assert client.specs[0] == [tools.ANSWER_SPEC]
+    assert client.specs[0] == tools.SPECS
+    assert client.forces[0] == "answer"
     assert client.calls[0][-1] == {"role": "user",
                                    "content": policy.FINAL_ANSWER_NUDGE}
-    assert "python tool is no longer available" in policy.FINAL_ANSWER_NUDGE
+    assert "Only the answer tool" in policy.FINAL_ANSWER_NUDGE
     assert state["turns"] == 1
     assert state["answer"] == "42"
 
 
-def test_trim_drops_oldest_tool_block_and_keeps_system():
-    big = {"role": "tool", "tool_call_id": "a", "content": "x" * 500}
+def test_cut_point_keeps_tool_results_with_their_call():
     messages = [
         {"role": "system", "content": "S"},
+        {"role": "user", "content": "task"},
         {"role": "assistant", "content": None, "tool_calls": [
-            {"id": "a", "type": "function", "function": {"name": "grep", "arguments": "{}"}}]},
-        big,
+            {"id": "a", "type": "function",
+             "function": {"name": "grep", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "a", "content": "x" * 500},
         {"role": "assistant", "content": None, "tool_calls": [
-            {"id": "b", "type": "function", "function": {"name": "grep", "arguments": "{}"}}]},
+            {"id": "b", "type": "function",
+             "function": {"name": "grep", "arguments": "{}"}}]},
         {"role": "tool", "tool_call_id": "b", "content": "y"},
     ]
-    kept = context.trim(messages, budget=600)
-    assert kept[0] == messages[0]
-    assert [m.get("tool_call_id") for m in kept if m["role"] == "tool"] == ["b"]
+    cut = context.cut_point(messages, keep_tokens=1, ratio=1.0)
+    head, older, tail = context.split(messages, cut)
+
+    assert cut == 4
+    assert head == messages[:2]
+    assert len(older) == 2
+    # The tail never starts with a tool result: the call and its result stay
+    # together, or the provider rejects the transcript.
+    assert tail[0]["role"] == "assistant"
+    assert [m.get("tool_call_id") for m in tail if m["role"] == "tool"] == ["b"]
+
+
+def test_estimate_anchors_on_the_measured_prompt_size():
+    messages = [{"role": "system", "content": "x" * 100}]
+    anchor = {"chars": 100, "tokens": 40}
+    assert context.estimate(messages, None, anchor) == 40
+    messages.append({"role": "user", "content": "y" * 100})
+    # 100 new chars at the fallback 2.5 chars/token.
+    assert context.estimate(messages, None, anchor) == 80
+
+
+def test_previous_summary_is_reused_not_resummarized():
+    message = context.summary_message("## Objective\n- q")
+    assert message["role"] == "user"
+    assert "## Objective" in context.previous_summary([message])
+    assert context.render_transcript([message]) == ""
+
+
+def test_prefix_is_append_only_between_turns(monkeypatch):
+    monkeypatch.setattr(policy, "MAX_TURNS", 4)
+    monkeypatch.setattr(policy, "FINAL_TURNS", 0)
+    monkeypatch.setattr(tools, "dispatch", lambda name, args, ctx: "ok")
+    client = scripted(call("grep", {"pattern": "a"}, "c1"),
+                      call("grep", {"pattern": "b"}, "c2"),
+                      call("answer", {"value": "1"}, "c3"))
+    graph.run("q", client, CTX)
+
+    for previous, current in zip(client.calls, client.calls[1:]):
+        assert current[:len(previous)] == previous
+
+
+def test_budget_compacts_older_turns_into_one_summary(monkeypatch):
+    monkeypatch.setattr(policy, "MAX_TURNS", 8)
+    monkeypatch.setattr(policy, "FINAL_TURNS", 0)
+    monkeypatch.setattr(policy, "CONTEXT_TOKENS", 3000)
+    monkeypatch.setattr(policy, "KEEP_RECENT_TOKENS", 400)
+    monkeypatch.setattr(policy, "CHARS_PER_TOKEN", 1.0)
+    monkeypatch.setattr(tools, "SPECS", [{"type": "function", "function": {
+        "name": "grep", "description": "", "parameters": {}}}])
+    monkeypatch.setattr(tools, "dispatch", lambda name, args, ctx: "x" * 900)
+
+    requests = []
+
+    def summarize(request):
+        requests.append(request)
+        return {"content": "## Objective\n- q\n\n## Evidence\n- x"}
+
+    replies = [call("grep", {"pattern": f"q{i}"}, f"c{i}") for i in range(5)]
+    replies.append(call("answer", {"value": "1"}, "c9"))
+    state = graph.run("q", scripted(*replies), CTX, summarize=summarize)
+
+    assert requests and "x" * 900 in requests[0]
+    event = state["compactions"][0]
+    assert event["fallback"] is False
+    assert event["dropped_messages"] >= 2
+    assert event["before_tokens"] > event["after_tokens"]
+    messages = state["messages"]
+    assert messages[0]["role"] == "system"
+    assert messages[1]["role"] == "user"
+    assert context.SUMMARY_PREFIX in messages[2]["content"]
+    assert messages[3]["role"] == "assistant"
+    assert state["answer"] == "1"
+
+
+def test_failed_summary_falls_back_and_keeps_the_episode_alive(monkeypatch):
+    monkeypatch.setattr(policy, "MAX_TURNS", 8)
+    monkeypatch.setattr(policy, "FINAL_TURNS", 0)
+    monkeypatch.setattr(policy, "CONTEXT_TOKENS", 3000)
+    monkeypatch.setattr(policy, "KEEP_RECENT_TOKENS", 400)
+    monkeypatch.setattr(policy, "CHARS_PER_TOKEN", 1.0)
+    monkeypatch.setattr(tools, "SPECS", [{"type": "function", "function": {
+        "name": "grep", "description": "", "parameters": {}}}])
+    monkeypatch.setattr(tools, "dispatch", lambda name, args, ctx: "x" * 900)
+
+    replies = [call("grep", {"pattern": f"q{i}"}, f"c{i}") for i in range(5)]
+    replies.append(call("answer", {"value": "1"}, "c9"))
+    state = graph.run("q", scripted(*replies), CTX,
+                      summarize=lambda request: {"content": "partial",
+                                                 "truncated": True})
+
+    event = state["compactions"][0]
+    assert event["fallback"] is True
+    assert "output limit" in event["error"]
+    assert not any(context.SUMMARY_PREFIX in str(m.get("content"))
+                   for m in state["messages"])
+    assert state["answer"] == "1"
 
 
 def test_read_file_stays_inside_the_domain_docs(tmp_path):

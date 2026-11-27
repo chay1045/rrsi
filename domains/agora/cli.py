@@ -78,6 +78,11 @@ class _Live:
                     f"usage={f.get('usage')}")
         if kind == "model_error":
             return f"[live] MODEL ERROR turn={f['turn']} {f['error']}"
+        if kind == "compaction":
+            return (f"[live] COMPACT turn={f['turn']} "
+                    f"before={f['before_tokens']} after={f['after_tokens']} "
+                    f"dropped={f['dropped_messages']} "
+                    f"fallback={f['fallback']} error={f.get('error')}")
         if kind == "tool_call":
             return (f"[live] TOOL {f['name']} "
                     f"args={_clip(json.dumps(f.get('args'), ensure_ascii=False), 900)}")
@@ -109,15 +114,16 @@ def _client():
     os.environ.pop("OPENAI_API_KEY", None)
     os.environ.pop("RRSI_API_KEY", None)
 
-    def call(messages: list[dict], specs: list[dict]) -> dict:
+    def call(messages: list[dict], specs: list[dict],
+             force: str | None = None) -> dict:
         request = {"model": MODEL, "messages": messages, "tools": specs,
                    "temperature": policy.TEMPERATURE,
                    "max_tokens": policy.MAX_TOKENS}
-        if specs == [tools.ANSWER_SPEC]:
+        if force == "answer":
             # The forced answer: the provider must not let the model continue.
             request["tool_choice"] = {"type": "function",
                                       "function": {"name": "answer"}}
-        elif specs == tools.FINAL_SPECS:
+        elif force == "required":
             # Final-phase calls before the last: python or answer, not text.
             request["tool_choice"] = "required"
         try:
@@ -139,6 +145,63 @@ def _client():
         return message
 
     return call
+
+
+def _summarizer():
+    """The compaction client: one summary call, no tools, temperature 0.
+
+    Thinking stays on by default, at the model's own setting (0.9 for Inkling);
+    pi forwards its session thinking level to the summarization call for the
+    same reason. ``AGORA_SUMMARY_REASONING_EFFORT`` can lower or disable it for
+    speed. That flag is a vLLM template kwarg, so a rejected request retries
+    without it, like tool_choice does.
+    """
+    from openai import BadRequestError, OpenAI, UnprocessableEntityError
+
+    endpoint = OpenAI(
+        base_url=os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1"),
+        api_key=os.environ.get("OPENAI_API_KEY") or "dummy")
+    effort = os.environ.get("AGORA_SUMMARY_REASONING_EFFORT")
+
+    def summarize(request: str) -> dict:
+        call = {"model": MODEL,
+                "messages": [
+                    {"role": "system", "content": prompts.SUMMARY_SYSTEM},
+                    {"role": "user", "content": request}],
+                "temperature": 0.0,
+                "max_tokens": policy.SUMMARY_MAX_TOKENS}
+        if effort:
+            call["chat_template_kwargs"] = {"reasoning_effort": effort}
+        try:
+            reply = endpoint.chat.completions.create(**call)
+        except (BadRequestError, UnprocessableEntityError) as exc:
+            if "chat_template_kwargs" not in call:
+                raise
+            print(f"warning: endpoint rejected chat_template_kwargs: {exc}; "
+                  "retrying without it", file=sys.stderr)
+            del call["chat_template_kwargs"]
+            reply = endpoint.chat.completions.create(**call)
+        choice = reply.choices[0]
+        # A checkpoint cut at the output cap omits its newest findings, so the
+        # harness treats it as a failed summary and falls back.
+        return {"content": choice.message.content or "",
+                "usage": reply.usage.model_dump() if reply.usage else {},
+                "truncated": choice.finish_reason == "length"}
+
+    return summarize
+
+
+def _notes() -> str | None:
+    """The episode's notes.md, read at compaction time and bounded."""
+    root = os.environ.get("AGORA_SCRATCH")
+    if not root:
+        return None
+    try:
+        text = (Path(root) / "notes.md").read_text(encoding="utf-8",
+                                                   errors="replace")
+    except OSError:
+        return None
+    return text[:policy.NOTES_CHARS] or None
 
 
 def _context(task: tasks.Task) -> tools.Context:
@@ -184,7 +247,8 @@ def _write(path: Path, text: str) -> None:
 
 
 def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
-             ctx: tools.Context | None = None) -> dict:
+             ctx: tools.Context | None = None, summarize=None,
+             notes=None) -> dict:
     """One episode; always leaves ``trajectory.json`` (unless skipped)."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -204,26 +268,30 @@ def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
     previous_scratch = os.environ.get("AGORA_SCRATCH")
 
     usage: dict = {}
-    history: list[dict] = []  # the whole episode, unlike the trimmed state
+    history: list[dict] = []  # the whole episode, unlike the compacted state
     seen: set = set()
     log("run_start", task=task.id, query=task.query, system=prompts.SYSTEM,
         model=MODEL, trial=trial, max_turns=policy.MAX_TURNS,
-        max_tokens=policy.MAX_TOKENS)
+        max_tokens=policy.MAX_TOKENS, context_window=policy.CONTEXT_WINDOW,
+        context_tokens=policy.CONTEXT_TOKENS,
+        keep_recent_tokens=policy.KEEP_RECENT_TOKENS)
 
     turn = 0
 
-    def model(messages: list[dict], specs: list[dict]) -> dict:
+    def model(messages: list[dict], specs: list[dict],
+              force: str | None = None) -> dict:
         nonlocal turn
         turn += 1
         log("model_request", turn=turn, messages=messages,
-            tools=[(spec.get("function") or {}).get("name") for spec in specs])
+            tools=[(spec.get("function") or {}).get("name") for spec in specs],
+            force=force)
         if not history:
             history.extend(messages)  # system + task, once
-        # A tool result reaches the model on the next call, trimmed later.
+        # A tool result reaches the model on the next call, compacted later.
         _add_tool_results(history, seen, messages)
         request_started = time.monotonic()
         try:
-            reply = dict(client(messages, specs))
+            reply = dict(client(messages, specs, force=force))
         except BaseException as exc:
             log("model_error", turn=turn,
                 error=f"{type(exc).__name__}: {exc}")
@@ -235,6 +303,10 @@ def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
         for key, value in (reply.pop("usage", None) or {}).items():
             if isinstance(value, (int, float)):
                 usage[key] = usage.get(key, 0) + value
+            elif key == "prompt_tokens_details" and isinstance(value, dict):
+                cached = value.get("cached_tokens")
+                if isinstance(cached, (int, float)):
+                    usage["cached_tokens"] = usage.get("cached_tokens", 0) + cached
         history.append(reply)
         return reply
 
@@ -257,10 +329,19 @@ def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
     os.environ["AGORA_SCRATCH"] = str(scratch.resolve())
     started = time.monotonic()
     interrupted = None
+    compactions: list[dict] = []
     try:
-        state = graph.run(task.query, model, ctx or _context(task))
+        state = graph.run(task.query, model, ctx or _context(task),
+                          summarize=summarize, notes=notes)
         status, error = "ok", None
         turns, answer = state["turns"], state["answer"]
+        compactions = state.get("compactions") or []
+        # The summary call is part of the episode cost, but not a model turn.
+        for key, value in (state.get("summary_usage") or {}).items():
+            if isinstance(value, (int, float)):
+                usage[key] = usage.get(key, 0) + value
+        for event in compactions:
+            log("compaction", **event)
         # The final act's result never reaches another model call.
         _add_tool_results(history, seen, state["messages"])
     except BaseException as exc:  # Ctrl-C / SIGTERM must still leave a trace
@@ -291,6 +372,7 @@ def run_task(task: tasks.Task, out_dir, trial: int = 0, client=None,
         "turns": turns,
         "wall_time_s": wall_time,
         "usage": usage,
+        "compactions": compactions,
         "tool_calls": _tool_calls(history),
         "messages": history,
     }
@@ -320,8 +402,12 @@ def main(argv: list[str] | None = None) -> int:
     if task is None:
         parser.error(f"unknown task: {task_id}")
 
+    # Build the summarizer first: _client() removes OPENAI_API_KEY from the
+    # process environment so the python tool cannot read it.
+    summarize = _summarizer()
     trajectory = run_task(task, args.out, args.trial, client=_client(),
-                          ctx=_context(task))
+                          ctx=_context(task), summarize=summarize,
+                          notes=_notes)
     print(f"{trajectory['status']}: {task.id} -> {args.out} "
           f"({trajectory['turns']} turns, "
           f"{trajectory['usage']['total_tokens']} tokens)")

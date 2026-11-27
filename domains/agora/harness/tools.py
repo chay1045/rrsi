@@ -244,10 +244,9 @@ PYTHON_SPEC = _spec(
     {"code": {"type": "string"}},
     ["code"])
 
-# Final calls before the last: python may compute the value, or answer ends the
-# episode early. The last call offers only answer.
-FINAL_SPECS = [PYTHON_SPEC, ANSWER_SPEC]
-
+# The tool list is fixed for the whole episode. The final phase restricts the
+# choice with tool_choice instead: the template renders the declaration before
+# the first message, so changing this list would invalidate the whole cache.
 SPECS = [
     _spec("search_docs",
           "Hybrid keyword and semantic search over the domain's documents. "

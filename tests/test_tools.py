@@ -103,7 +103,7 @@ def test_graph_passes_the_requested_depth_to_search_docs(indexed):
     replies = iter([call("search_docs", {"query": "q", "k": 10}, "c1"),
                     call("answer", {"value": "done"}, "c2")])
 
-    def client(messages, specs):
+    def client(messages, specs, force=None):
         return dict(next(replies))
 
     state = graph.run("q", client, indexed)

@@ -1,14 +1,23 @@
 """LangGraph loop: agent -> tools -> agent, until ``answer`` or MAX_TURNS.
 
-The model client is injected: ``client(messages, tool_specs) -> message`` where
-message is an OpenAI-style assistant dict (``content`` and ``tool_calls``), with
-an optional ``usage`` key that is summed into the trajectory and never sent
-back to the model. Tests pass a scripted callable; cli.py passes one that wraps
-the OpenAI client.
+The model client is injected: ``client(messages, tool_specs, force=None)``
+returns an OpenAI-style assistant dict (``content`` and ``tool_calls``), with an
+optional ``usage`` key that is summed into the trajectory and never sent back to
+the model. ``force`` is the request's ``tool_choice``: None, ``"required"`` or a
+tool name. Tests pass a scripted callable; cli.py passes one that wraps the
+OpenAI client.
 
-The last ``policy.FINAL_TURNS`` calls form a bounded final phase: one nudge is
-appended; earlier final calls may use python, and the last call receives only
-the answer tool.
+History is append-only until ``policy.CONTEXT_TOKENS``: the prompt cache then
+matches the previous request except for the newest turn. At the budget,
+``context`` replaces the older part with one summary and keeps
+``policy.KEEP_RECENT_TOKENS`` verbatim. The summary is an injected callable, so
+the graph stays model- and endpoint-agnostic; ``notes`` reads notes.md for the
+summary input.
+
+The last ``policy.FINAL_TURNS`` calls form a bounded final phase. The tool list
+never changes, because the template renders it before the first message: a
+changed list would invalidate the whole prefix. The phase is enforced with
+``tool_choice`` and one nudge; the last call accepts only ``answer``.
 """
 
 from __future__ import annotations
@@ -26,6 +35,7 @@ _RECENT_CALLS = 20       # exact-repeat detection window
 
 class State(TypedDict, total=False):
     messages: list[dict]
+    task: str
     turns: int
     empty_retries: int
     final_nudged: bool
@@ -33,6 +43,9 @@ class State(TypedDict, total=False):
     repeat_nudged: str | None
     answer: str
     usage: dict
+    anchor: dict | None
+    compactions: list[dict]
+    summary_usage: dict
 
 
 def _tool_message(call: dict, content: str) -> dict:
@@ -88,12 +101,28 @@ def _last_text(messages: list[dict]) -> str:
     return ""
 
 
-def _add_usage(usage: dict, reply: dict) -> dict:
-    used = dict(usage or {})
-    for key, value in (reply.pop("usage", None) or {}).items():
+def _sum_usage(target: dict, usage: dict | None) -> dict:
+    """Add one usage report to ``target``; keep the nested cache count flat."""
+    for key, value in (usage or {}).items():
         if isinstance(value, (int, float)):
-            used[key] = used.get(key, 0) + value
-    return used
+            target[key] = target.get(key, 0) + value
+        elif key == "prompt_tokens_details" and isinstance(value, dict):
+            cached = value.get("cached_tokens")
+            if isinstance(cached, (int, float)):
+                target["cached_tokens"] = target.get("cached_tokens", 0) + cached
+    return target
+
+
+def _add_usage(usage: dict, reply: dict) -> dict:
+    return _sum_usage(dict(usage or {}), reply.pop("usage", None))
+
+
+def _anchor(messages: list[dict], specs: list[dict], usage: dict | None) -> dict | None:
+    """The exact prompt size the endpoint just measured, with its char count."""
+    tokens = (usage or {}).get("prompt_tokens")
+    if not isinstance(tokens, (int, float)) or tokens <= 0:
+        return None
+    return {"chars": context.total_chars(messages, specs), "tokens": int(tokens)}
 
 
 def _final_phase(state: State) -> bool:
@@ -102,40 +131,111 @@ def _final_phase(state: State) -> bool:
             and state["turns"] >= policy.MAX_TURNS - policy.FINAL_TURNS)
 
 
-def build(client=None, ctx: tools.Context | None = None):
+def build(client=None, ctx: tools.Context | None = None, summarize=None,
+          notes=None):
     """Compile the graph. ``client`` is only needed when it is invoked.
+
+    ``summarize(request) -> {"content": str, "usage": dict, "truncated": bool}``
+    is optional. Without it, the older part is dropped deterministically when
+    the budget is crossed, so tests and offline runs never need an endpoint.
+    ``notes`` is an optional callable that returns notes.md for the summary.
 
     ``run()`` sets the recursion limit to match MAX_TURNS; a direct ``invoke``
     keeps LangGraph's default and would stop after ~12 turns.
     """
 
+    def _maybe_compact(state: State, messages: list[dict],
+                       specs: list[dict]) -> tuple[list[dict], dict]:
+        """Replace the older part with a summary when the prompt is over budget."""
+        anchor = state.get("anchor")
+        before = context.estimate(messages, specs, anchor)
+        if before <= policy.CONTEXT_TOKENS:
+            return messages, {}
+        cut = context.cut_point(messages, policy.KEEP_RECENT_TOKENS,
+                                context.chars_per_token(anchor))
+        if cut is None:
+            return messages, {}
+        head, older, tail = context.split(messages, cut)
+        if not older:
+            return messages, {}
+        event = {"turn": state["turns"] + 1, "before_tokens": before,
+                 "dropped_messages": len(older)}
+        update: dict = {}
+        text, summary_usage, error = "", {}, None
+        if summarize is None:
+            error = "summary unavailable"
+        else:
+            try:
+                request = context.summary_request(
+                    state.get("task") or str((messages[1] if len(messages) > 1
+                                              else {}).get("content") or ""),
+                    context.render_transcript(older),
+                    context.previous_summary(older),
+                    notes() if notes is not None else None)
+                result = summarize(request)
+                if isinstance(result, str):
+                    result = {"content": result}
+                result = result or {}
+                text = str(result.get("content") or "").strip()
+                summary_usage = dict(result.get("usage") or {})
+                if result.get("truncated"):
+                    error = "summary reached the output limit"
+                elif not text:
+                    error = "summary was empty"
+            except Exception as exc:  # a failed summary must not end the episode
+                error = f"{type(exc).__name__}: {exc}"
+        if error:
+            messages = context.without_older(messages, cut)
+            event["fallback"] = True
+            event["error"] = error
+        else:
+            messages = head + [context.summary_message(text)] + tail
+            event["summary_chars"] = len(text)
+            event["summary"] = text
+            event["fallback"] = False
+        event["after_tokens"] = context.estimate(messages, specs, None)
+        update["anchor"] = None
+        update["compactions"] = list(state.get("compactions") or []) + [event]
+        if summary_usage:
+            update["summary_usage"] = _sum_usage(
+                dict(state.get("summary_usage") or {}), summary_usage)
+        return messages, update
+
     def agent(state: State) -> dict:
         if client is None:
             raise RuntimeError("graph.build() needs client=<callable> to run")
-        messages = context.trim(state["messages"])
+        messages = state["messages"]
         specs = tools.SPECS
         update: dict = {"turns": state["turns"] + 1}
+        nudge = None
+        force = None
         if _final_phase(state):
             if state["turns"] >= policy.MAX_TURNS - 1:
-                # The last allowed call: commit. Revoke python explicitly; the
-                # earlier nudge still permits it and the model may follow that.
-                specs = [tools.ANSWER_SPEC]
-                messages = messages + [{"role": "user",
-                                        "content": policy.FINAL_ANSWER_NUDGE}]
+                # The last allowed call: commit. The tool list stays the same;
+                # tool_choice is what revokes every route except answer.
+                force = "answer"
+                nudge = policy.FINAL_ANSWER_NUDGE
             else:
-                # Earlier final calls: allow python, but only answer or python.
-                specs = tools.FINAL_SPECS
+                # Earlier final calls: python is still available, and a call
+                # other than answer is required.
+                force = "required"
                 if not state.get("final_nudged"):
-                    messages = messages + [{"role": "user",
-                                            "content": policy.FINAL_NUDGE}]
+                    nudge = policy.FINAL_NUDGE
                     update["final_nudged"] = True
         else:
             repeat = _repeated_call_nudge(state)
             if repeat:
-                messages = messages + [{"role": "user", "content": repeat}]
+                nudge = repeat
                 update["repeat_nudged"] = state["recent_calls"][-1]
-        reply = dict(client(messages, specs))
+        messages, compacted = _maybe_compact(state, messages, specs)
+        update.update(compacted)
+        if nudge:
+            messages = messages + [{"role": "user", "content": nudge}]
+        reply = dict(client(messages, specs, force=force))
         update["messages"] = messages + [reply]
+        anchor = _anchor(messages, specs, reply.get("usage"))
+        if anchor:
+            update["anchor"] = anchor
         if reply.get("usage"):
             update["usage"] = _add_usage(state.get("usage"), reply)
         return update
@@ -207,13 +307,14 @@ def build(client=None, ctx: tools.Context | None = None):
     return graph.compile()
 
 
-def run(task: str, client, ctx: tools.Context) -> dict:
+def run(task: str, client, ctx: tools.Context, summarize=None, notes=None) -> dict:
     """One episode. Returns the final state plus a never-empty ``answer``."""
-    state = build(client, ctx).invoke(
+    state = build(client, ctx, summarize, notes).invoke(
         {"messages": [{"role": "system", "content": prompts.SYSTEM},
                       {"role": "user", "content": task}],
-         "turns": 0, "empty_retries": 0, "recent_calls": [],
-         "repeat_nudged": None},
+         "task": task, "turns": 0, "empty_retries": 0, "recent_calls": [],
+         "repeat_nudged": None, "anchor": None, "compactions": [],
+         "summary_usage": {}},
         {"recursion_limit": 2 * policy.MAX_TURNS + 5})
     state["answer"] = state.get("answer") or _last_text(state["messages"]) or "UNKNOWN"
     return state

@@ -138,18 +138,26 @@ def test_env_args_forward_the_reranker_endpoint(monkeypatch):
 
 def test_env_args_forward_the_policy_budget(monkeypatch):
     monkeypatch.setenv("AGORA_TEMPERATURE", "0.6")
-    monkeypatch.setenv("AGORA_CONTEXT_CHARS", "96000")
+    monkeypatch.setenv("AGORA_CONTEXT_WINDOW", "262144")
+    monkeypatch.setenv("AGORA_SUMMARY_REASONING_EFFORT", "none")
+    monkeypatch.setenv("AGORA_SUMMARY_MAX_TOKENS", "8192")
     args = ADAPTER._env_args()
     assert "AGORA_TEMPERATURE=0.6" in args
-    assert "AGORA_CONTEXT_CHARS=96000" in args
+    assert "AGORA_CONTEXT_WINDOW=262144" in args
+    assert "AGORA_SUMMARY_REASONING_EFFORT=none" in args
+    assert "AGORA_SUMMARY_MAX_TOKENS=8192" in args
 
 
 def test_env_args_omit_unset_policy_budget(monkeypatch):
     monkeypatch.delenv("AGORA_TEMPERATURE", raising=False)
-    monkeypatch.delenv("AGORA_CONTEXT_CHARS", raising=False)
+    monkeypatch.delenv("AGORA_CONTEXT_WINDOW", raising=False)
+    monkeypatch.delenv("AGORA_SUMMARY_REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("AGORA_SUMMARY_MAX_TOKENS", raising=False)
     args = ADAPTER._env_args()
     assert not any(arg.startswith("AGORA_TEMPERATURE=") for arg in args)
-    assert not any(arg.startswith("AGORA_CONTEXT_CHARS=") for arg in args)
+    assert not any(arg.startswith("AGORA_CONTEXT_WINDOW=") for arg in args)
+    assert not any(arg.startswith("AGORA_SUMMARY_REASONING_EFFORT=") for arg in args)
+    assert not any(arg.startswith("AGORA_SUMMARY_MAX_TOKENS=") for arg in args)
 
 
 def test_task_timeout_default_and_override(monkeypatch):

@@ -32,7 +32,7 @@ def call(name, args, call_id="c1"):
 def scripted(*replies):
     pending = list(replies)
 
-    def client(messages, specs):
+    def client(messages, specs, force=None):
         return dict(pending.pop(0))
     return client
 
@@ -80,7 +80,7 @@ def test_failure_writes_partial_trajectory_and_exits_nonzero(tmp_path, monkeypat
                         "usage": {"total_tokens": 4}})
     calls = []
 
-    def flaky(messages, specs):
+    def flaky(messages, specs, force=None):
         calls.append(messages)
         if len(calls) > 1:
             raise ConnectionError("endpoint down")
@@ -99,29 +99,42 @@ def test_failure_writes_partial_trajectory_and_exits_nonzero(tmp_path, monkeypat
     assert not (out / "answer.txt").exists()
 
 
-def test_context_trimming_does_not_shorten_the_trajectory(tmp_path, monkeypatch):
-    # The harness trims old turns out of its state to stay under the char
-    # budget. The trajectory must still hold the whole episode, or the analyst
-    # reading it never sees the loop that burned the tokens.
-    monkeypatch.setattr(cli.policy, "MAX_TURNS", 5)
+def test_compaction_does_not_shorten_the_trajectory(tmp_path, monkeypatch):
+    # The harness replaces older turns with a summary in its own state. The
+    # trajectory must still hold the whole episode, or the analyst reading it
+    # never sees the loop that burned the tokens.
+    monkeypatch.setattr(cli.policy, "MAX_TURNS", 6)
     monkeypatch.setattr(cli.policy, "FINAL_TURNS", 0)
-    # The budget must stay above the system prompt plus one tool block, so the
-    # test measures trimming rather than an undersized prompt. Four 3000-char
-    # results still exceed it and force old blocks out.
-    monkeypatch.setattr(cli.policy, "CONTEXT_CHARS", 8000)
+    monkeypatch.setattr(cli.policy, "CONTEXT_TOKENS", 3000)
+    monkeypatch.setattr(cli.policy, "KEEP_RECENT_TOKENS", 400)
+    monkeypatch.setattr(cli.policy, "CHARS_PER_TOKEN", 1.0)
+    monkeypatch.setattr(cli.tools, "SPECS", [{"type": "function", "function": {
+        "name": "grep", "description": "", "parameters": {}}}])
     monkeypatch.setattr(cli.tools, "dispatch",
-                        lambda name, args, ctx: "x" * 3000)
+                        lambda name, args, ctx: "x" * 900)
+
+    requests = []
+
+    def summarize(request):
+        requests.append(request)
+        return {"content": "## Objective\n- q\n\n## Evidence\n- x",
+                "usage": {"total_tokens": 3}}
 
     replies = [{**call("grep", {"pattern": "m"}, f"c{i}"), "usage": {"total_tokens": 1}}
                for i in range(4)]
     replies.append({**call("answer", {"value": "10.37 pp"}, "c9"),
                     "usage": {"total_tokens": 1}})
-    trajectory = cli.run_task(TASK, tmp_path, client=scripted(*replies), ctx=CTX)
+    trajectory = cli.run_task(TASK, tmp_path, client=scripted(*replies),
+                              ctx=CTX, summarize=summarize,
+                              notes=lambda: "notes evidence")
 
     assert trajectory["turns"] == 5
+    assert trajectory["compactions"]
+    assert "notes evidence" in requests[0]
     assert [c["name"] for c in trajectory["tool_calls"]] == ["grep"] * 4 + ["answer"]
-    assert [len(c["output"]) for c in trajectory["tool_calls"]] == [3000] * 4 + [16]
+    assert [len(c["output"]) for c in trajectory["tool_calls"]] == [900] * 4 + [16]
     assert [m["role"] for m in trajectory["messages"]].count("tool") == 5
+    assert trajectory["usage"]["total_tokens"] == 5 + 3 * len(trajectory["compactions"])
     assert (tmp_path / "answer.txt").read_text() == "10.37 pp\n"
 
 
@@ -168,7 +181,7 @@ def test_main_resolves_the_task_id(tmp_path, monkeypatch):
 
 
 def test_interrupt_still_writes_a_partial_trajectory(tmp_path):
-    def interrupted(messages, specs):
+    def interrupted(messages, specs, force=None):
         raise KeyboardInterrupt
 
     with pytest.raises(KeyboardInterrupt):
@@ -179,12 +192,13 @@ def test_interrupt_still_writes_a_partial_trajectory(tmp_path):
     assert not (tmp_path / "answer.txt").exists()
 
 
-def _reply(content="10.37 pp"):
+def _reply(content="10.37 pp", finish_reason="stop"):
     from types import SimpleNamespace
 
     return SimpleNamespace(
         choices=[SimpleNamespace(
-            message=SimpleNamespace(content=content, tool_calls=None))],
+            message=SimpleNamespace(content=content, tool_calls=None),
+            finish_reason=finish_reason)],
         usage=SimpleNamespace(model_dump=lambda: {"total_tokens": 1}))
 
 
@@ -202,7 +216,7 @@ def _fake_endpoint(monkeypatch, completions):
     return openai
 
 
-def test_client_forces_answer_and_allows_python_in_the_final_phase(monkeypatch):
+def test_client_maps_force_to_tool_choice(monkeypatch):
     requests = []
 
     class Completions:
@@ -215,14 +229,15 @@ def test_client_forces_answer_and_allows_python_in_the_final_phase(monkeypatch):
     monkeypatch.setenv("RRSI_API_KEY", "dummy")
     client = cli._client()
 
-    client([{"role": "user", "content": "q"}], cli.tools.FINAL_SPECS)
-    client([{"role": "user", "content": "q"}], [cli.tools.ANSWER_SPEC])
+    client([{"role": "user", "content": "q"}], cli.tools.SPECS, force="required")
+    client([{"role": "user", "content": "q"}], cli.tools.SPECS, force="answer")
     client([{"role": "user", "content": "q"}], cli.tools.SPECS)
 
     assert requests[0]["tool_choice"] == "required"
     assert requests[1]["tool_choice"] == {
         "type": "function", "function": {"name": "answer"}}
     assert "tool_choice" not in requests[2]
+    assert requests[0]["tools"] == requests[1]["tools"] == cli.tools.SPECS
 
 
 def test_client_reports_a_rejected_tool_choice_and_retries_once(monkeypatch, capsys):
@@ -245,10 +260,61 @@ def test_client_reports_a_rejected_tool_choice_and_retries_once(monkeypatch, cap
     monkeypatch.setenv("RRSI_API_KEY", "dummy")
 
     reply = cli._client()([{"role": "user", "content": "q"}],
-                          [cli.tools.ANSWER_SPEC])
+                          cli.tools.SPECS, force="answer")
 
     assert reply["content"] == "10.37 pp"
     assert len(requests) == 2
     assert "tool_choice" in requests[0]
     assert "tool_choice" not in requests[1]
     assert "rejected tool_choice" in capsys.readouterr().err
+
+
+def test_summarizer_has_no_tools_and_keeps_thinking_on(monkeypatch):
+    requests = []
+
+    class Completions:
+        def create(self, **kwargs):
+            requests.append(kwargs)
+            return _reply("checkpoint")
+
+    _fake_endpoint(monkeypatch, Completions())
+    monkeypatch.setenv("OPENAI_API_KEY", "dummy")
+    monkeypatch.delenv("AGORA_SUMMARY_REASONING_EFFORT", raising=False)
+
+    result = cli._summarizer()("compress this")
+
+    assert result == {"content": "checkpoint",
+                      "usage": {"total_tokens": 1},
+                      "truncated": False}
+    assert "tools" not in requests[0]
+    assert requests[0]["temperature"] == 0.0
+    assert requests[0]["max_tokens"] == cli.policy.SUMMARY_MAX_TOKENS
+    assert "chat_template_kwargs" not in requests[0]
+
+
+def test_summarizer_flags_a_truncated_checkpoint(monkeypatch):
+    class Completions:
+        def create(self, **kwargs):
+            return _reply("partial", finish_reason="length")
+
+    _fake_endpoint(monkeypatch, Completions())
+    monkeypatch.setenv("OPENAI_API_KEY", "dummy")
+
+    assert cli._summarizer()("compress")["truncated"] is True
+
+
+def test_summarizer_passes_the_effort_override(monkeypatch):
+    requests = []
+
+    class Completions:
+        def create(self, **kwargs):
+            requests.append(kwargs)
+            return _reply("checkpoint")
+
+    _fake_endpoint(monkeypatch, Completions())
+    monkeypatch.setenv("OPENAI_API_KEY", "dummy")
+    monkeypatch.setenv("AGORA_SUMMARY_REASONING_EFFORT", "none")
+
+    cli._summarizer()("compress")
+
+    assert requests[0]["chat_template_kwargs"] == {"reasoning_effort": "none"}

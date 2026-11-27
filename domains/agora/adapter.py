@@ -255,7 +255,8 @@ def _env_args() -> list[str]:
     """Only the variables the episode needs. Never forward the host env."""
     names = ("AGORA_MODEL", "OPENAI_BASE_URL", "OPENAI_API_KEY", "AGORA_LIVE",
              "AGORA_RERANK_URL", "AGORA_RERANK_MODEL", "AGORA_TEMPERATURE",
-             "AGORA_CONTEXT_CHARS")
+             "AGORA_CONTEXT_WINDOW", "AGORA_SUMMARY_MAX_TOKENS",
+             "AGORA_SUMMARY_REASONING_EFFORT")
     args: list[str] = []
     for name in names:
         value = os.environ.get(name)
@@ -276,7 +277,9 @@ class AgoraDomain(Domain):
     # proposer still sees the real failure family in the hypothesis.
     component_signals = [
         ("context_mgmt",    [r"context\.py", r"\btrim\(", r"CONTEXT_CHARS",
-                             r"compact", r"keep_last", r"budget"]),
+                             r"compact", r"keep_last", r"budget",
+                             r"CONTEXT_TOKENS", r"CONTEXT_WINDOW",
+                             r"KEEP_RECENT_TOKENS", r"SUMMARY_MAX_TOKENS"]),
         ("output_plumbing", [r"SNIPPET_CHARS", r"READ_CHARS", r"GREP_HITS",
                              r"PY_CHARS", r"truncat", r"snippet", r"_clip"]),
         ("client_tool",     [r"search_docs", r"index_search", r"match_expression",
